@@ -1,0 +1,25 @@
+[package]
+name = "kestrel-search"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Embedded transactional full-text search engine with a direct Rust API"
+
+[lib]
+name = "kestrel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kestrel"
+path = "src/main.rs"
+
+[[bench]]
+name = "topk"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
