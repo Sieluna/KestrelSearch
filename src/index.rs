@@ -17,7 +17,6 @@ pub(crate) struct StoredDocument {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BlockMeta {
-    pub start: u32,
     pub end: u32,
     pub last_docid: u32,
     pub max_tf: u32,
@@ -93,7 +92,6 @@ impl PostingList {
             let docids = &self.docids[start..end];
             let freqs = &self.freqs[start..end];
             self.blocks.push(BlockMeta {
-                start: start as u32,
                 end: end as u32,
                 last_docid: *docids.last().unwrap(),
                 max_tf: freqs.iter().copied().max().unwrap(),
@@ -109,6 +107,46 @@ impl PostingList {
     #[inline]
     pub fn find(&self, docid: u32) -> Option<usize> {
         self.docids.binary_search(&docid).ok()
+    }
+}
+
+struct WandCursor<'a> {
+    list: &'a PostingList,
+    index: usize,
+    idf: f32,
+    scale: f32,
+    list_bound: f32,
+}
+
+impl WandCursor<'_> {
+    #[inline]
+    fn exhausted(&self) -> bool {
+        self.index >= self.list.docids.len()
+    }
+
+    #[inline]
+    fn docid(&self) -> u32 {
+        self.list.docids[self.index]
+    }
+
+    #[inline]
+    fn block_bound(&self, avgdl: f32, options: SearchOptions) -> f32 {
+        let block = &self.list.blocks[self.index / POSTING_BLOCK_SIZE];
+        debug_assert!(self.docid() <= block.last_docid);
+        let exact = bm25(self.idf, block.max_tf, block.min_doc_len, avgdl, options);
+        dequantize_upper(quantize_upper(exact, self.scale), self.scale)
+    }
+
+    fn skip_block(&mut self) {
+        self.index = self.list.blocks[self.index / POSTING_BLOCK_SIZE].end as usize;
+    }
+
+    fn advance_to(&mut self, target: u32) -> usize {
+        let old_block = self.index / POSTING_BLOCK_SIZE;
+        let offset = self.list.docids[self.index..].partition_point(|docid| *docid < target);
+        self.index += offset;
+        let new_block = self.index / POSTING_BLOCK_SIZE;
+        new_block.saturating_sub(old_block)
     }
 }
 
@@ -235,28 +273,11 @@ impl Snapshot {
         } else {
             self.total_doc_len as f32 / self.live_docs as f32
         };
-        let global_max: HashMap<&str, f32> = terms
-            .iter()
-            .map(|term| {
-                let idf = self.idf(term);
-                let max = self
-                    .segments
-                    .iter()
-                    .filter_map(|segment| segment.terms.get(term))
-                    .map(|list| bm25(idf, list.max_tf, list.min_doc_len, avgdl, options))
-                    .fold(0.0, f32::max);
-                (term.as_str(), max)
-            })
-            .collect();
-        let score_scales: HashMap<&str, f32> = global_max
-            .iter()
-            .map(|(term, max)| (*term, *max / f32::from(u16::MAX)))
-            .collect();
         let mut ranked = Vec::<SearchHit>::with_capacity(options.limit);
-        let mut seen = HashSet::<(usize, u32)>::new();
 
-        if terms.is_empty() {
+        if exhaustive || terms.is_empty() {
             for location in self.latest.values().filter(|location| !location.deleted) {
+                stats.candidate_docs += 1;
                 self.consider(
                     query,
                     &terms,
@@ -269,57 +290,81 @@ impl Snapshot {
                 );
             }
         } else {
-            let mut ordered_terms = terms.clone();
-            ordered_terms.sort_by(|a, b| {
-                global_max[b.as_str()]
-                    .total_cmp(&global_max[a.as_str()])
-                    .then_with(|| a.cmp(b))
-            });
-
-            for term in &ordered_terms {
-                let term_other_max: f64 = ordered_terms
+            for (segment_index, segment) in self.segments.iter().enumerate() {
+                let mut cursors: Vec<_> = terms
                     .iter()
-                    .filter(|other| *other != term)
-                    .map(|other| f64::from(global_max[other.as_str()]))
-                    .sum();
-                let idf = self.idf(term);
-                for (segment_index, segment) in self.segments.iter().enumerate() {
-                    let Some(list) = segment.terms.get(term) else {
-                        continue;
-                    };
-                    for block in &list.blocks {
+                    .filter_map(|term| {
+                        let list = segment.terms.get(term)?;
+                        let idf = self.idf(term);
+                        let exact_bound = bm25(idf, list.max_tf, list.min_doc_len, avgdl, options);
+                        let scale = exact_bound / f32::from(u16::MAX);
+                        let list_bound =
+                            dequantize_upper(quantize_upper(exact_bound, scale), scale);
+                        Some(WandCursor {
+                            list,
+                            index: 0,
+                            idf,
+                            scale,
+                            list_bound,
+                        })
+                    })
+                    .collect();
+
+                while !cursors.is_empty() {
+                    cursors.retain(|cursor| !cursor.exhausted());
+                    if cursors.is_empty() {
+                        break;
+                    }
+                    cursors.sort_by_key(WandCursor::docid);
+                    let theta = threshold(&ranked, options.limit);
+
+                    // A first-list block can be discarded only after adding every
+                    // other cursor's list-wide upper bound.
+                    if ranked.len() == options.limit {
                         stats.posting_blocks += 1;
-                        let theta = threshold(&ranked, options.limit);
-                        let exact_block_bound =
-                            bm25(idf, block.max_tf, block.min_doc_len, avgdl, options);
-                        let block_bound = f64::from(dequantize_upper(
-                            quantize_upper(exact_block_bound, score_scales[term.as_str()]),
-                            score_scales[term.as_str()],
-                        )) + term_other_max;
-                        // Strict comparison preserves the deterministic rowid tie-break.
-                        if !exhaustive
-                            && ranked.len() == options.limit
-                            && block_bound < f64::from(theta)
-                        {
+                        let first_block_bound = f64::from(cursors[0].block_bound(avgdl, options))
+                            + cursors[1..]
+                                .iter()
+                                .map(|cursor| f64::from(cursor.list_bound))
+                                .sum::<f64>();
+                        if first_block_bound < f64::from(theta) {
+                            cursors[0].skip_block();
                             stats.skipped_blocks += 1;
                             continue;
                         }
-                        debug_assert_eq!(list.docids[block.end as usize - 1], block.last_docid);
-                        for &docid in &list.docids[block.start as usize..block.end as usize] {
-                            if seen.insert((segment_index, docid)) {
-                                stats.candidate_docs += 1;
-                                self.consider(
-                                    query,
-                                    &terms,
-                                    segment_index,
-                                    docid,
-                                    avgdl,
-                                    options,
-                                    &mut ranked,
-                                    &mut stats,
-                                );
-                            }
-                        }
+                    }
+
+                    let mut accumulated = 0.0_f64;
+                    let pivot = cursors.iter().position(|cursor| {
+                        accumulated += f64::from(cursor.list_bound);
+                        ranked.len() < options.limit || accumulated >= f64::from(theta)
+                    });
+                    let Some(pivot) = pivot else {
+                        break;
+                    };
+                    let pivot_doc = cursors[pivot].docid();
+
+                    if cursors[0].docid() < pivot_doc {
+                        stats.skipped_blocks += cursors[0].advance_to(pivot_doc);
+                        continue;
+                    }
+
+                    stats.candidate_docs += 1;
+                    self.consider(
+                        query,
+                        &terms,
+                        segment_index,
+                        pivot_doc,
+                        avgdl,
+                        options,
+                        &mut ranked,
+                        &mut stats,
+                    );
+                    for cursor in cursors
+                        .iter_mut()
+                        .take_while(|cursor| cursor.docid() == pivot_doc)
+                    {
+                        cursor.index += 1;
                     }
                 }
             }

@@ -111,6 +111,23 @@ fn pruned_results_equal_exhaustive_results() {
             );
         }
     }
+
+    let measured = db
+        .search(
+            &Query::or([
+                Query::term("rare"),
+                Query::term("third"),
+                Query::term("common"),
+            ]),
+            SearchOptions {
+                limit: 10,
+                cache: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(measured.stats.skipped_blocks > 0);
+    assert!(measured.stats.scored_docs < db.len() as usize);
     fs::remove_dir_all(path).unwrap();
 }
 

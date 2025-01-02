@@ -22,6 +22,9 @@ const WAL_MAGIC: &[u8; 8] = b"KSTWAL01";
 const SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG01";
 const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
 
+type WalCommit = (u64, Vec<Operation>);
+type WalContents = (Vec<WalCommit>, u64);
+
 #[derive(Clone, Copy, Debug)]
 pub struct DatabaseConfig {
     /// Number of generation-scoped top-k results retained in the in-process LRU.
@@ -91,6 +94,7 @@ impl Database {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&wal_path)?;
         let (commits, valid_len) = read_wal(&mut wal)?;
         if wal.metadata()?.len() != valid_len {
@@ -463,7 +467,7 @@ fn write_framed_file(path: &Path, magic: &[u8; 8], payload: &[u8]) -> Result<()>
     Ok(())
 }
 
-fn read_wal(file: &mut File) -> Result<(Vec<(u64, Vec<Operation>)>, u64)> {
+fn read_wal(file: &mut File) -> Result<WalContents> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
