@@ -50,12 +50,34 @@ fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
 }
 
 pub(crate) fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c9dc5_u32;
+    let mut crc = u32::MAX;
     for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x01000193);
+        let index = ((crc as u8) ^ byte) as usize;
+        crc = CRC32C_TABLE[index] ^ (crc >> 8);
     }
-    hash
+    !crc
+}
+
+const CRC32C_TABLE: [u32; 256] = crc32c_table();
+
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 == 1 {
+                0x82f63b78 ^ (value >> 1)
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
 }
 
 #[cfg(test)]
@@ -73,5 +95,10 @@ mod tests {
         assert_eq!(read_i64(&mut input).unwrap(), -91);
         assert_eq!(read_bytes(&mut input).unwrap(), b"hello");
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn crc32c_matches_standard_vector() {
+        assert_eq!(checksum(b"123456789"), 0xe306_9283);
     }
 }

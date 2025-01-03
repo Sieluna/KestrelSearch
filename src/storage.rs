@@ -625,6 +625,25 @@ mod tests {
     }
 
     #[test]
+    fn corruption_before_wal_tail_is_rejected() {
+        let path = temp_dir("corrupt");
+        let db = Database::open(&path).unwrap();
+        for rowid in 1..=2 {
+            let mut tx = db.begin();
+            tx.upsert_text(rowid, format!("commit {rowid}")).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(db);
+
+        let wal_path = path.join("kestrel.wal");
+        let mut bytes = fs::read(&wal_path).unwrap();
+        bytes[20] ^= 0x80;
+        fs::write(&wal_path, bytes).unwrap();
+        assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn checkpoint_restores_compacted_view() {
         let path = temp_dir("checkpoint");
         {
