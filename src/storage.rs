@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -49,7 +50,7 @@ struct Inner {
     snapshot: RwLock<Arc<Snapshot>>,
     wal: Mutex<File>,
     writer: Mutex<()>,
-    cache: Mutex<QueryCache>,
+    cache: CacheShards,
     checkpoint_nonce: AtomicU64,
 }
 
@@ -77,6 +78,10 @@ struct QueryCache {
     capacity: usize,
     entries: HashMap<CacheKey, Arc<SearchResult>>,
     order: VecDeque<CacheKey>,
+}
+
+struct CacheShards {
+    shards: Box<[Mutex<QueryCache>]>,
 }
 
 impl Database {
@@ -118,7 +123,7 @@ impl Database {
                 snapshot: RwLock::new(Arc::new(snapshot)),
                 wal: Mutex::new(wal),
                 writer: Mutex::new(()),
-                cache: Mutex::new(QueryCache::new(config.query_cache_capacity)),
+                cache: CacheShards::new(config.query_cache_capacity),
                 checkpoint_nonce: AtomicU64::new(seed),
             }),
         })
@@ -142,7 +147,7 @@ impl Database {
             b: options.b.to_bits(),
         };
         if options.cache
-            && let Some(mut result) = self.inner.cache.lock().unwrap().get(&key)
+            && let Some(mut result) = self.inner.cache.get(&key)
         {
             result.stats.cache_hit = true;
             return Ok(result);
@@ -150,11 +155,7 @@ impl Database {
 
         let result = snapshot.search(query, options, false);
         if options.cache {
-            self.inner
-                .cache
-                .lock()
-                .unwrap()
-                .insert(key, Arc::new(result.clone()));
+            self.inner.cache.insert(key, Arc::new(result.clone()));
         }
         Ok(result)
     }
@@ -230,7 +231,7 @@ impl Database {
         write_framed_file(&temp, SEGMENT_MAGIC, &payload)?;
         fs::rename(&temp, &final_path)?;
         *self.inner.snapshot.write().unwrap() = Arc::new(compacted);
-        self.inner.cache.lock().unwrap().clear();
+        self.inner.cache.clear();
         Ok(())
     }
 
@@ -261,7 +262,7 @@ impl Database {
 
         let next = apply_operations(&current, generation, operations);
         *self.inner.snapshot.write().unwrap() = Arc::new(next);
-        self.inner.cache.lock().unwrap().clear();
+        self.inner.cache.clear();
         Ok(generation)
     }
 }
@@ -339,6 +340,38 @@ impl QueryCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+    }
+}
+
+impl CacheShards {
+    fn new(total_capacity: usize) -> Self {
+        let shard_count = total_capacity.clamp(1, 16);
+        let shard_capacity = total_capacity.div_ceil(shard_count);
+        let shards = (0..shard_count)
+            .map(|_| Mutex::new(QueryCache::new(shard_capacity)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<SearchResult> {
+        self.shard(key).lock().unwrap().get(key)
+    }
+
+    fn insert(&self, key: CacheKey, value: Arc<SearchResult>) {
+        self.shard(&key).lock().unwrap().insert(key, value);
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().unwrap().clear();
+        }
+    }
+
+    fn shard(&self, key: &CacheKey) -> &Mutex<QueryCache> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.shards[hasher.finish() as usize % self.shards.len()]
     }
 }
 

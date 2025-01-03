@@ -1,6 +1,8 @@
 use std::{
     fs,
     path::PathBuf,
+    sync::Arc,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -160,6 +162,36 @@ fn cache_is_generation_scoped_and_invalidated() {
             .stats
             .cache_hit
     );
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn concurrent_readers_share_sharded_cache() {
+    let path = temp_dir("concurrent-cache");
+    let db = Arc::new(Database::open(&path).unwrap());
+    let mut tx = db.begin();
+    for rowid in 0..500 {
+        tx.upsert_text(rowid, format!("shared cache term{}", rowid % 17))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    let readers: Vec<_> = (0..8)
+        .map(|reader| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                for round in 0..100 {
+                    let query = Query::term(format!("term{}", (reader + round) % 17));
+                    let result = db.search(&query, SearchOptions::default()).unwrap();
+                    assert_eq!(result.generation, 1);
+                }
+            })
+        })
+        .collect();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    drop(db);
     fs::remove_dir_all(path).unwrap();
 }
 
