@@ -63,6 +63,39 @@ fn cjk_bigrams_are_searchable() {
 }
 
 #[test]
+fn column_and_near_queries_verify_positions_after_candidate_generation() {
+    let path = temp_dir("positions");
+    let db = Database::open(&path).unwrap();
+    let mut tx = db.begin();
+    tx.upsert(1, ["rust engine", "embedded database search"])
+        .unwrap();
+    tx.upsert(2, ["database", "rust fast engine search"])
+        .unwrap();
+    tx.upsert(3, ["rust", "engine separated across columns"])
+        .unwrap();
+    tx.upsert(4, ["rust once", "nothing nearby"]).unwrap();
+    tx.upsert(5, ["rust rust", "two occurrences"]).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(ids(&db, &Query::column(0, Query::term("engine"))), [1]);
+    assert_eq!(ids(&db, &Query::column(1, Query::term("engine"))), [2, 3]);
+    assert_eq!(ids(&db, &Query::near(["rust", "engine"], 2)), [1, 2]);
+    assert_eq!(
+        ids(&db, &Query::column(1, Query::near(["rust", "engine"], 2))),
+        [2]
+    );
+    assert_eq!(ids(&db, &Query::near(["rust", "rust"], 1)), [5]);
+    assert!(
+        ids(
+            &db,
+            &Query::column(0, Query::column(1, Query::term("engine")))
+        )
+        .is_empty()
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn pruned_results_equal_exhaustive_results() {
     let path = temp_dir("differential");
     let db = Database::open(&path).unwrap();

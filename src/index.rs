@@ -451,7 +451,10 @@ impl Snapshot {
                     terms.insert(term.clone());
                 }
             }
-            Query::Phrase(phrase) if positive => terms.extend(phrase.iter().cloned()),
+            Query::Phrase(phrase) | Query::Near { terms: phrase, .. } if positive => {
+                terms.extend(phrase.iter().cloned());
+            }
+            Query::Column { query, .. } => self.collect_terms(query, positive, terms),
             Query::And(children) | Query::Or(children) => {
                 for child in children {
                     self.collect_terms(child, positive, terms);
@@ -464,29 +467,55 @@ impl Snapshot {
 }
 
 fn matches_query(segment: &Segment, docid: u32, query: &Query) -> bool {
+    matches_query_in_column(segment, docid, query, None)
+}
+
+fn matches_query_in_column(
+    segment: &Segment,
+    docid: u32,
+    query: &Query,
+    column: Option<u8>,
+) -> bool {
     match query {
-        Query::Term(term) => segment
-            .terms
-            .get(term)
-            .is_some_and(|list| list.find(docid).is_some()),
+        Query::Term(term) => term_positions(segment, docid, term)
+            .is_some_and(|positions| positions_in_column(positions, column)),
         Query::Prefix(prefix) => segment
             .terms
             .range(prefix.clone()..)
             .take_while(|(term, _)| term.starts_with(prefix))
-            .any(|(_, list)| list.find(docid).is_some()),
-        Query::Phrase(terms) => matches_phrase(segment, docid, terms),
+            .any(|(_, list)| {
+                list.find(docid)
+                    .is_some_and(|index| positions_in_column(&list.positions[index], column))
+            }),
+        Query::Phrase(terms) => matches_phrase(segment, docid, terms, column),
+        Query::Near { terms, distance } => matches_near(segment, docid, terms, *distance, column),
+        Query::Column {
+            column: restricted,
+            query,
+        } => {
+            if column.is_some_and(|outer| outer != *restricted) {
+                false
+            } else {
+                matches_query_in_column(segment, docid, query, Some(*restricted))
+            }
+        }
         Query::And(children) => children
             .iter()
-            .all(|child| matches_query(segment, docid, child)),
+            .all(|child| matches_query_in_column(segment, docid, child, column)),
         Query::Or(children) => children
             .iter()
-            .any(|child| matches_query(segment, docid, child)),
-        Query::Not(child) => !matches_query(segment, docid, child),
+            .any(|child| matches_query_in_column(segment, docid, child, column)),
+        Query::Not(child) => !matches_query_in_column(segment, docid, child, column),
         Query::All => true,
     }
 }
 
-fn matches_phrase(segment: &Segment, docid: u32, terms: &[String]) -> bool {
+fn matches_phrase(
+    segment: &Segment,
+    docid: u32,
+    terms: &[String],
+    required_column: Option<u8>,
+) -> bool {
     if terms.is_empty() {
         return false;
     }
@@ -508,10 +537,91 @@ fn matches_phrase(segment: &Segment, docid: u32, terms: &[String]) -> bool {
     let Some(rest) = rest else { return false };
     first.iter().any(|start| {
         let column = start >> COLUMN_SHIFT;
+        if required_column.is_some_and(|required| u32::from(required) != column) {
+            return false;
+        }
         rest.iter().enumerate().all(|(offset, positions)| {
             let target = start.saturating_add(offset as u32 + 1);
             target >> COLUMN_SHIFT == column && positions.binary_search(&target).is_ok()
         })
+    })
+}
+
+fn matches_near(
+    segment: &Segment,
+    docid: u32,
+    terms: &[String],
+    distance: u32,
+    required_column: Option<u8>,
+) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let mut requirements = Vec::<(&str, usize)>::new();
+    for term in terms {
+        if let Some((_, count)) = requirements
+            .iter_mut()
+            .find(|(existing, _)| *existing == term)
+        {
+            *count += 1;
+        } else {
+            requirements.push((term, 1));
+        }
+    }
+    let mut events = Vec::<(u32, usize)>::new();
+    for (term_index, (term, _)) in requirements.iter().enumerate() {
+        let Some(positions) = term_positions(segment, docid, term) else {
+            return false;
+        };
+        for &position in positions {
+            let column = (position >> COLUMN_SHIFT) as u8;
+            if required_column.is_none_or(|required| required == column) {
+                events.push((position, term_index));
+            }
+        }
+    }
+    events.sort_unstable();
+
+    let mut counts = vec![0_usize; requirements.len()];
+    let mut covered = 0_usize;
+    let mut left = 0_usize;
+    for right in 0..events.len() {
+        let (_, term) = events[right];
+        counts[term] += 1;
+        if counts[term] == requirements[term].1 {
+            covered += 1;
+        }
+
+        while covered == requirements.len() {
+            let (left_position, left_term) = events[left];
+            let (right_position, _) = events[right];
+            let same_column = left_position >> COLUMN_SHIFT == right_position >> COLUMN_SHIFT;
+            let span = (right_position & ((1 << COLUMN_SHIFT) - 1))
+                .saturating_sub(left_position & ((1 << COLUMN_SHIFT) - 1));
+            if same_column && span <= distance {
+                return true;
+            }
+            if counts[left_term] == requirements[left_term].1 {
+                covered -= 1;
+            }
+            counts[left_term] -= 1;
+            left += 1;
+        }
+    }
+    false
+}
+
+fn term_positions<'a>(segment: &'a Segment, docid: u32, term: &str) -> Option<&'a [u32]> {
+    let list = segment.terms.get(term)?;
+    let index = list.find(docid)?;
+    Some(&list.positions[index])
+}
+
+fn positions_in_column(positions: &[u32], column: Option<u8>) -> bool {
+    column.is_none_or(|column| {
+        positions
+            .iter()
+            .any(|position| position >> COLUMN_SHIFT == u32::from(column))
     })
 }
 

@@ -6,6 +6,8 @@ pub enum Query {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
+    Near { terms: Vec<String>, distance: u32 },
+    Column { column: u8, query: Box<Query> },
     And(Vec<Query>),
     Or(Vec<Query>),
     Not(Box<Query>),
@@ -32,6 +34,27 @@ impl Query {
                 .map(|term| normalize_term(term.as_ref()))
                 .collect(),
         )
+    }
+
+    pub fn near<I, S>(terms: I, distance: u32) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::Near {
+            terms: terms
+                .into_iter()
+                .map(|term| normalize_term(term.as_ref()))
+                .collect(),
+            distance,
+        }
+    }
+
+    pub fn column(column: u8, query: Query) -> Self {
+        Self::Column {
+            column: column.min(63),
+            query: Box::new(query),
+        }
     }
 
     pub fn and(queries: impl IntoIterator<Item = Query>) -> Self {
