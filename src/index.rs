@@ -38,15 +38,13 @@ pub(crate) struct PostingList {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Segment {
-    pub generation: u64,
     pub docs: Vec<StoredDocument>,
     pub terms: BTreeMap<String, PostingList>,
 }
 
 impl Segment {
-    pub fn build(generation: u64, docs: Vec<(i64, Vec<String>)>) -> Self {
+    pub fn build(docs: Vec<(i64, Vec<String>)>) -> Self {
         let mut segment = Self {
-            generation,
             docs: Vec::with_capacity(docs.len()),
             terms: BTreeMap::new(),
         };
@@ -152,7 +150,6 @@ impl WandCursor<'_> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Location {
-    pub generation: u64,
     pub segment: usize,
     pub docid: u32,
     pub deleted: bool,
@@ -163,6 +160,7 @@ pub(crate) struct Snapshot {
     pub generation: u64,
     pub segments: Vec<std::sync::Arc<Segment>>,
     pub latest: HashMap<i64, Location>,
+    pub live_masks: Vec<std::sync::Arc<Vec<u64>>>,
     pub term_df: HashMap<String, u32>,
     pub live_docs: u64,
     pub total_doc_len: u64,
@@ -185,7 +183,6 @@ impl Snapshot {
             next.latest.insert(
                 *rowid,
                 Location {
-                    generation,
                     segment: 0,
                     docid: 0,
                     deleted: true,
@@ -195,7 +192,7 @@ impl Snapshot {
 
         if !docs.is_empty() {
             let segment_index = next.segments.len();
-            let segment = std::sync::Arc::new(Segment::build(generation, docs));
+            let segment = std::sync::Arc::new(Segment::build(docs));
             for (docid, doc) in segment.docs.iter().enumerate() {
                 next.remove_latest(doc.rowid);
                 next.live_docs += 1;
@@ -206,13 +203,14 @@ impl Snapshot {
                 next.latest.insert(
                     doc.rowid,
                     Location {
-                        generation,
                         segment: segment_index,
                         docid: docid as u32,
                         deleted: false,
                     },
                 );
             }
+            next.live_masks
+                .push(std::sync::Arc::new(full_live_mask(segment.docs.len())));
             next.segments.push(segment);
         }
         next
@@ -226,6 +224,8 @@ impl Snapshot {
             return;
         }
         let doc = &self.segments[location.segment].docs[location.docid as usize];
+        let mask = std::sync::Arc::make_mut(&mut self.live_masks[location.segment]);
+        mask[location.docid as usize / 64] &= !(1_u64 << (location.docid % 64));
         self.live_docs -= 1;
         self.total_doc_len -= u64::from(doc.len);
         for term in &doc.unique_terms {
@@ -254,12 +254,7 @@ impl Snapshot {
 
     #[inline]
     fn is_live(&self, segment: usize, docid: u32) -> bool {
-        let doc = &self.segments[segment].docs[docid as usize];
-        matches!(self.latest.get(&doc.rowid), Some(location)
-            if !location.deleted
-                && location.segment == segment
-                && location.docid == docid
-                && location.generation == self.segments[segment].generation)
+        self.live_masks[segment][docid as usize / 64] & (1_u64 << (docid % 64)) != 0
     }
 
     pub fn search(&self, query: &Query, options: SearchOptions, exhaustive: bool) -> SearchResult {
@@ -268,19 +263,26 @@ impl Snapshot {
             ..SearchStats::default()
         };
         let terms = self.expanded_scoring_terms(query);
+        let scoring_terms: Vec<_> = terms
+            .iter()
+            .map(|term| ScoringTerm {
+                term,
+                idf: self.idf(term),
+            })
+            .collect();
         let avgdl = if self.live_docs == 0 {
             1.0
         } else {
             self.total_doc_len as f32 / self.live_docs as f32
         };
-        let mut ranked = Vec::<SearchHit>::with_capacity(options.limit);
+        let mut ranked = Vec::<RankedDoc>::with_capacity(options.limit);
 
         if exhaustive || terms.is_empty() {
             for location in self.latest.values().filter(|location| !location.deleted) {
                 stats.candidate_docs += 1;
                 self.consider(
                     query,
-                    &terms,
+                    &scoring_terms,
                     location.segment,
                     location.docid,
                     avgdl,
@@ -291,19 +293,19 @@ impl Snapshot {
             }
         } else {
             for (segment_index, segment) in self.segments.iter().enumerate() {
-                let mut cursors: Vec<_> = terms
+                let mut cursors: Vec<_> = scoring_terms
                     .iter()
-                    .filter_map(|term| {
-                        let list = segment.terms.get(term)?;
-                        let idf = self.idf(term);
-                        let exact_bound = bm25(idf, list.max_tf, list.min_doc_len, avgdl, options);
+                    .filter_map(|scoring| {
+                        let list = segment.terms.get(scoring.term)?;
+                        let exact_bound =
+                            bm25(scoring.idf, list.max_tf, list.min_doc_len, avgdl, options);
                         let scale = exact_bound / f32::from(u16::MAX);
                         let list_bound =
                             dequantize_upper(quantize_upper(exact_bound, scale), scale);
                         Some(WandCursor {
                             list,
                             index: 0,
-                            idf,
+                            idf: scoring.idf,
                             scale,
                             list_bound,
                         })
@@ -352,7 +354,7 @@ impl Snapshot {
                     stats.candidate_docs += 1;
                     self.consider(
                         query,
-                        &terms,
+                        &scoring_terms,
                         segment_index,
                         pivot_doc,
                         avgdl,
@@ -376,8 +378,19 @@ impl Snapshot {
                 .then_with(|| a.rowid.cmp(&b.rowid))
         });
         ranked.truncate(options.limit);
+        let hits = ranked
+            .into_iter()
+            .map(|ranked| {
+                let doc = &self.segments[ranked.segment].docs[ranked.docid as usize];
+                SearchHit {
+                    rowid: ranked.rowid,
+                    score: ranked.score,
+                    fields: doc.fields.clone(),
+                }
+            })
+            .collect();
         SearchResult {
-            hits: ranked,
+            hits,
             stats,
             generation: self.generation,
             is_approximate: false,
@@ -388,12 +401,12 @@ impl Snapshot {
     fn consider(
         &self,
         query: &Query,
-        terms: &[String],
+        terms: &[ScoringTerm<'_>],
         segment_index: usize,
         docid: u32,
         avgdl: f32,
         options: SearchOptions,
-        ranked: &mut Vec<SearchHit>,
+        ranked: &mut Vec<RankedDoc>,
         stats: &mut SearchStats,
     ) {
         if !self.is_live(segment_index, docid) {
@@ -405,24 +418,25 @@ impl Snapshot {
         }
         stats.scored_docs += 1;
         let doc = &segment.docs[docid as usize];
+        let budget = bm25_budget(doc.len, avgdl, options);
         let score = terms
             .iter()
-            .filter_map(|term| {
-                let list = segment.terms.get(term)?;
+            .filter_map(|scoring| {
+                let list = segment.terms.get(scoring.term)?;
                 let index = list.find(docid)?;
-                Some(bm25(
-                    self.idf(term),
+                Some(bm25_with_budget(
+                    scoring.idf,
                     list.freqs[index],
-                    doc.len,
-                    avgdl,
-                    options,
+                    budget,
+                    options.k1,
                 ))
             })
             .sum();
-        let hit = SearchHit {
+        let hit = RankedDoc {
+            segment: segment_index,
+            docid,
             rowid: doc.rowid,
             score,
-            fields: doc.fields.clone(),
         };
         push_top_k(ranked, hit, options.limit);
     }
@@ -630,12 +644,35 @@ fn bm25(idf: f32, freq: u32, doc_len: u32, avgdl: f32, options: SearchOptions) -
     if freq == 0 {
         return 0.0;
     }
-    let f = freq as f32;
-    let budget = options.k1 * (1.0 - options.b + options.b * doc_len as f32 / avgdl.max(1.0));
-    idf * (f * (options.k1 + 1.0)) / (f + budget)
+    bm25_with_budget(idf, freq, bm25_budget(doc_len, avgdl, options), options.k1)
 }
 
-fn push_top_k(ranked: &mut Vec<SearchHit>, hit: SearchHit, k: usize) {
+#[inline(always)]
+fn bm25_budget(doc_len: u32, avgdl: f32, options: SearchOptions) -> f32 {
+    options.k1 * (1.0 - options.b + options.b * doc_len as f32 / avgdl.max(1.0))
+}
+
+#[inline(always)]
+fn bm25_with_budget(idf: f32, freq: u32, budget: f32, k1: f32) -> f32 {
+    let f = freq as f32;
+    idf * (f * (k1 + 1.0)) / (f + budget)
+}
+
+#[derive(Clone, Copy)]
+struct ScoringTerm<'a> {
+    term: &'a str,
+    idf: f32,
+}
+
+#[derive(Clone, Copy)]
+struct RankedDoc {
+    segment: usize,
+    docid: u32,
+    rowid: i64,
+    score: f32,
+}
+
+fn push_top_k(ranked: &mut Vec<RankedDoc>, hit: RankedDoc, k: usize) {
     if ranked.len() < k {
         ranked.push(hit);
     } else if let Some((worst, _)) = ranked.iter().enumerate().min_by(|(_, a), (_, b)| {
@@ -649,7 +686,7 @@ fn push_top_k(ranked: &mut Vec<SearchHit>, hit: SearchHit, k: usize) {
     }
 }
 
-fn threshold(ranked: &[SearchHit], k: usize) -> f32 {
+fn threshold(ranked: &[RankedDoc], k: usize) -> f32 {
     if ranked.len() < k {
         0.0
     } else {
@@ -658,6 +695,17 @@ fn threshold(ranked: &[SearchHit], k: usize) -> f32 {
             .map(|hit| hit.score)
             .fold(f32::INFINITY, f32::min)
     }
+}
+
+fn full_live_mask(docs: usize) -> Vec<u64> {
+    let mut mask = vec![u64::MAX; docs.div_ceil(64)];
+    if let Some(last) = mask.last_mut() {
+        let remainder = docs % 64;
+        if remainder != 0 {
+            *last = (1_u64 << remainder) - 1;
+        }
+    }
+    mask
 }
 
 pub(crate) fn quantize_upper(score: f32, scale: f32) -> u16 {
@@ -695,7 +743,7 @@ mod tests {
         let docs = (0..300)
             .map(|id| (id, vec!["same term".to_owned()]))
             .collect();
-        let segment = Segment::build(1, docs);
+        let segment = Segment::build(docs);
         let list = &segment.terms["same"];
         assert_eq!(list.blocks.len(), 3);
         assert_eq!(list.blocks[0].end, 128);
