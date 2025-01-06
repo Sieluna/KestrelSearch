@@ -230,8 +230,18 @@ impl Database {
             .join(format!("segment-{}-{nonce}.kst", compacted.generation));
         write_framed_file(&temp, SEGMENT_MAGIC, &payload)?;
         fs::rename(&temp, &final_path)?;
+
+        // The durable checkpoint now covers every generation in the WAL. Rotate
+        // only after the rename so a crash always leaves at least one source of truth.
+        {
+            let mut wal = self.inner.wal.lock().unwrap();
+            wal.set_len(0)?;
+            wal.seek(SeekFrom::Start(0))?;
+            wal.sync_all()?;
+        }
         *self.inner.snapshot.write().unwrap() = Arc::new(compacted);
         self.inner.cache.clear();
+        remove_old_checkpoints(&self.inner.path, &final_path)?;
         Ok(())
     }
 
@@ -573,6 +583,22 @@ fn load_latest_checkpoint(path: &Path) -> Result<Option<Snapshot>> {
     Ok(best)
 }
 
+fn remove_old_checkpoints(directory: &Path, keep: &Path) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.starts_with("segment-") && file_name.ends_with(".kst") {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
 fn read_checkpoint(path: &Path) -> Result<(u64, Vec<Operation>)> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
@@ -689,10 +715,35 @@ mod tests {
             tx.upsert_text(2, "keep me").unwrap();
             tx.commit().unwrap();
             db.optimize().unwrap();
+            assert_eq!(fs::metadata(path.join("kestrel.wal")).unwrap().len(), 0);
+
+            let mut after_checkpoint = db.begin();
+            after_checkpoint
+                .upsert_text(3, "written after checkpoint")
+                .unwrap();
+            assert_eq!(after_checkpoint.commit().unwrap(), 3);
+            db.optimize().unwrap();
+            let checkpoints = fs::read_dir(&path)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "kst"))
+                .count();
+            assert_eq!(checkpoints, 1);
         }
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.len(), 2);
+        assert_eq!(db.len(), 3);
+        assert_eq!(db.generation(), 3);
         assert_eq!(db.get(1).unwrap(), ["new value"]);
+        assert_eq!(db.get(3).unwrap(), ["written after checkpoint"]);
+
+        let mut tx = db.begin();
+        tx.upsert_text(4, "new WAL generation").unwrap();
+        assert_eq!(tx.commit().unwrap(), 4);
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.generation(), 4);
+        assert_eq!(reopened.len(), 4);
+        drop(reopened);
         fs::remove_dir_all(path).unwrap();
     }
 }
