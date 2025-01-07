@@ -111,6 +111,7 @@ impl PostingList {
 struct WandCursor<'a> {
     list: &'a PostingList,
     index: usize,
+    ordinal: usize,
     idf: f32,
     scale: f32,
     list_bound: f32,
@@ -270,6 +271,7 @@ impl Snapshot {
                 idf: self.idf(term),
             })
             .collect();
+        let direct_disjunction = is_flat_disjunction(query);
         let avgdl = if self.live_docs == 0 {
             1.0
         } else {
@@ -295,7 +297,8 @@ impl Snapshot {
             for (segment_index, segment) in self.segments.iter().enumerate() {
                 let mut cursors: Vec<_> = scoring_terms
                     .iter()
-                    .filter_map(|scoring| {
+                    .enumerate()
+                    .filter_map(|(ordinal, scoring)| {
                         let list = segment.terms.get(scoring.term)?;
                         let exact_bound =
                             bm25(scoring.idf, list.max_tf, list.min_doc_len, avgdl, options);
@@ -305,6 +308,7 @@ impl Snapshot {
                         Some(WandCursor {
                             list,
                             index: 0,
+                            ordinal,
                             idf: scoring.idf,
                             scale,
                             list_bound,
@@ -317,12 +321,17 @@ impl Snapshot {
                     if cursors.is_empty() {
                         break;
                     }
-                    cursors.sort_by_key(WandCursor::docid);
+                    cursors.sort_by(|left, right| {
+                        left.docid()
+                            .cmp(&right.docid())
+                            .then_with(|| left.ordinal.cmp(&right.ordinal))
+                    });
                     let theta = threshold(&ranked, options.limit);
 
                     // A first-list block can be discarded only after adding every
                     // other cursor's list-wide upper bound.
-                    if ranked.len() == options.limit {
+                    if ranked.len() == options.limit && (!direct_disjunction || cursors.len() == 1)
+                    {
                         stats.posting_blocks += 1;
                         let first_block_bound = f64::from(cursors[0].block_bound(avgdl, options))
                             + cursors[1..]
@@ -352,16 +361,28 @@ impl Snapshot {
                     }
 
                     stats.candidate_docs += 1;
-                    self.consider(
-                        query,
-                        &scoring_terms,
-                        segment_index,
-                        pivot_doc,
-                        avgdl,
-                        options,
-                        &mut ranked,
-                        &mut stats,
-                    );
+                    if direct_disjunction {
+                        self.consider_wand_candidate(
+                            segment_index,
+                            pivot_doc,
+                            &cursors,
+                            avgdl,
+                            options,
+                            &mut ranked,
+                            &mut stats,
+                        );
+                    } else {
+                        self.consider(
+                            query,
+                            &scoring_terms,
+                            segment_index,
+                            pivot_doc,
+                            avgdl,
+                            options,
+                            &mut ranked,
+                            &mut stats,
+                        );
+                    }
                     for cursor in cursors
                         .iter_mut()
                         .take_while(|cursor| cursor.docid() == pivot_doc)
@@ -441,6 +462,47 @@ impl Snapshot {
         push_top_k(ranked, hit, options.limit);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn consider_wand_candidate(
+        &self,
+        segment_index: usize,
+        docid: u32,
+        cursors: &[WandCursor<'_>],
+        avgdl: f32,
+        options: SearchOptions,
+        ranked: &mut Vec<RankedDoc>,
+        stats: &mut SearchStats,
+    ) {
+        if !self.is_live(segment_index, docid) {
+            return;
+        }
+        stats.scored_docs += 1;
+        let doc = &self.segments[segment_index].docs[docid as usize];
+        let budget = bm25_budget(doc.len, avgdl, options);
+        let score = cursors
+            .iter()
+            .take_while(|cursor| cursor.docid() == docid)
+            .map(|cursor| {
+                bm25_with_budget(
+                    cursor.idf,
+                    cursor.list.freqs[cursor.index],
+                    budget,
+                    options.k1,
+                )
+            })
+            .sum();
+        push_top_k(
+            ranked,
+            RankedDoc {
+                segment: segment_index,
+                docid,
+                rowid: doc.rowid,
+                score,
+            },
+            options.limit,
+        );
+    }
+
     fn idf(&self, term: &str) -> f32 {
         let n = self.live_docs as f32;
         let df = self.term_df.get(term).copied().unwrap_or(0) as f32;
@@ -482,6 +544,19 @@ impl Snapshot {
 
 fn matches_query(segment: &Segment, docid: u32, query: &Query) -> bool {
     matches_query_in_column(segment, docid, query, None)
+}
+
+fn is_flat_disjunction(query: &Query) -> bool {
+    match query {
+        Query::Term(_) | Query::Prefix(_) => true,
+        Query::Or(children) => {
+            !children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| matches!(child, Query::Term(_) | Query::Prefix(_)))
+        }
+        _ => false,
+    }
 }
 
 fn matches_query_in_column(
