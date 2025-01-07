@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+};
 
 use crate::{
     query::{Query, SearchHit, SearchOptions, SearchResult, SearchStats},
@@ -277,7 +280,7 @@ impl Snapshot {
         } else {
             self.total_doc_len as f32 / self.live_docs as f32
         };
-        let mut ranked = Vec::<RankedDoc>::with_capacity(options.limit);
+        let mut ranked = TopK::new(options.limit);
 
         if exhaustive || terms.is_empty() {
             for location in self.latest.values().filter(|location| !location.deleted) {
@@ -326,12 +329,11 @@ impl Snapshot {
                             .cmp(&right.docid())
                             .then_with(|| left.ordinal.cmp(&right.ordinal))
                     });
-                    let theta = threshold(&ranked, options.limit);
+                    let theta = ranked.threshold();
 
                     // A first-list block can be discarded only after adding every
                     // other cursor's list-wide upper bound.
-                    if ranked.len() == options.limit && (!direct_disjunction || cursors.len() == 1)
-                    {
+                    if ranked.is_full() && (!direct_disjunction || cursors.len() == 1) {
                         stats.posting_blocks += 1;
                         let first_block_bound = f64::from(cursors[0].block_bound(avgdl, options))
                             + cursors[1..]
@@ -348,7 +350,7 @@ impl Snapshot {
                     let mut accumulated = 0.0_f64;
                     let pivot = cursors.iter().position(|cursor| {
                         accumulated += f64::from(cursor.list_bound);
-                        ranked.len() < options.limit || accumulated >= f64::from(theta)
+                        !ranked.is_full() || accumulated >= f64::from(theta)
                     });
                     let Some(pivot) = pivot else {
                         break;
@@ -393,13 +395,8 @@ impl Snapshot {
             }
         }
 
-        ranked.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.rowid.cmp(&b.rowid))
-        });
-        ranked.truncate(options.limit);
         let hits = ranked
+            .into_sorted()
             .into_iter()
             .map(|ranked| {
                 let doc = &self.segments[ranked.segment].docs[ranked.docid as usize];
@@ -427,7 +424,7 @@ impl Snapshot {
         docid: u32,
         avgdl: f32,
         options: SearchOptions,
-        ranked: &mut Vec<RankedDoc>,
+        ranked: &mut TopK,
         stats: &mut SearchStats,
     ) {
         if !self.is_live(segment_index, docid) {
@@ -459,7 +456,7 @@ impl Snapshot {
             rowid: doc.rowid,
             score,
         };
-        push_top_k(ranked, hit, options.limit);
+        ranked.push(hit);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -470,7 +467,7 @@ impl Snapshot {
         cursors: &[WandCursor<'_>],
         avgdl: f32,
         options: SearchOptions,
-        ranked: &mut Vec<RankedDoc>,
+        ranked: &mut TopK,
         stats: &mut SearchStats,
     ) {
         if !self.is_live(segment_index, docid) {
@@ -491,16 +488,12 @@ impl Snapshot {
                 )
             })
             .sum();
-        push_top_k(
-            ranked,
-            RankedDoc {
-                segment: segment_index,
-                docid,
-                rowid: doc.rowid,
-                score,
-            },
-            options.limit,
-        );
+        ranked.push(RankedDoc {
+            segment: segment_index,
+            docid,
+            rowid: doc.rowid,
+            score,
+        });
     }
 
     fn idf(&self, term: &str) -> f32 {
@@ -739,7 +732,7 @@ struct ScoringTerm<'a> {
     idf: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct RankedDoc {
     segment: usize,
     docid: u32,
@@ -747,28 +740,79 @@ struct RankedDoc {
     score: f32,
 }
 
-fn push_top_k(ranked: &mut Vec<RankedDoc>, hit: RankedDoc, k: usize) {
-    if ranked.len() < k {
-        ranked.push(hit);
-    } else if let Some((worst, _)) = ranked.iter().enumerate().min_by(|(_, a), (_, b)| {
-        a.score
-            .total_cmp(&b.score)
-            .then_with(|| b.rowid.cmp(&a.rowid))
-    }) && (hit.score > ranked[worst].score
-        || (hit.score == ranked[worst].score && hit.rowid < ranked[worst].rowid))
-    {
-        ranked[worst] = hit;
+impl PartialEq for RankedDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits()
+            && self.rowid == other.rowid
+            && self.segment == other.segment
+            && self.docid == other.docid
     }
 }
 
-fn threshold(ranked: &[RankedDoc], k: usize) -> f32 {
-    if ranked.len() < k {
-        0.0
-    } else {
+impl Eq for RankedDoc {}
+
+impl PartialOrd for RankedDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedDoc {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.rowid.cmp(&other.rowid))
+            .then_with(|| self.segment.cmp(&other.segment))
+            .then_with(|| self.docid.cmp(&other.docid))
+    }
+}
+
+struct TopK {
+    limit: usize,
+    heap: BinaryHeap<RankedDoc>,
+}
+
+impl TopK {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit),
+        }
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.heap.len() == self.limit
+    }
+
+    #[inline]
+    fn threshold(&self) -> f32 {
+        if self.is_full() {
+            self.heap.peek().unwrap().score
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, hit: RankedDoc) {
+        if !self.is_full() {
+            self.heap.push(hit);
+        } else if hit < *self.heap.peek().unwrap() {
+            *self.heap.peek_mut().unwrap() = hit;
+        }
+    }
+
+    fn into_sorted(self) -> Vec<RankedDoc> {
+        let mut ranked = self.heap.into_vec();
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.rowid.cmp(&right.rowid))
+        });
         ranked
-            .iter()
-            .map(|hit| hit.score)
-            .fold(f32::INFINITY, f32::min)
     }
 }
 
