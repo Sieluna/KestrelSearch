@@ -152,6 +152,30 @@ impl WandCursor<'_> {
     }
 }
 
+fn cursor_order(left: &WandCursor<'_>, right: &WandCursor<'_>) -> Ordering {
+    left.docid()
+        .cmp(&right.docid())
+        .then_with(|| left.ordinal.cmp(&right.ordinal))
+}
+
+fn sort_cursors(cursors: &mut [WandCursor<'_>]) {
+    cursors.sort_unstable_by(cursor_order);
+}
+
+fn restore_cursor_order(cursors: &mut Vec<WandCursor<'_>>) {
+    if cursors[0].exhausted() {
+        cursors.remove(0);
+        return;
+    }
+    let mut index = 0;
+    while index + 1 < cursors.len()
+        && cursor_order(&cursors[index], &cursors[index + 1]) == Ordering::Greater
+    {
+        cursors.swap(index, index + 1);
+        index += 1;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Location {
     pub segment: usize,
@@ -318,17 +342,9 @@ impl Snapshot {
                         })
                     })
                     .collect();
+                sort_cursors(&mut cursors);
 
                 while !cursors.is_empty() {
-                    cursors.retain(|cursor| !cursor.exhausted());
-                    if cursors.is_empty() {
-                        break;
-                    }
-                    cursors.sort_by(|left, right| {
-                        left.docid()
-                            .cmp(&right.docid())
-                            .then_with(|| left.ordinal.cmp(&right.ordinal))
-                    });
                     let theta = ranked.threshold();
 
                     // A first-list block can be discarded only after adding every
@@ -342,6 +358,7 @@ impl Snapshot {
                                 .sum::<f64>();
                         if first_block_bound < f64::from(theta) {
                             cursors[0].skip_block();
+                            restore_cursor_order(&mut cursors);
                             stats.skipped_blocks += 1;
                             continue;
                         }
@@ -359,6 +376,7 @@ impl Snapshot {
 
                     if cursors[0].docid() < pivot_doc {
                         stats.skipped_blocks += cursors[0].advance_to(pivot_doc);
+                        restore_cursor_order(&mut cursors);
                         continue;
                     }
 
@@ -385,12 +403,15 @@ impl Snapshot {
                             &mut stats,
                         );
                     }
-                    for cursor in cursors
-                        .iter_mut()
+                    let matching = cursors
+                        .iter()
                         .take_while(|cursor| cursor.docid() == pivot_doc)
-                    {
+                        .count();
+                    for cursor in &mut cursors[..matching] {
                         cursor.index += 1;
                     }
+                    cursors.retain(|cursor| !cursor.exhausted());
+                    sort_cursors(&mut cursors);
                 }
             }
         }
