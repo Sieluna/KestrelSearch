@@ -299,6 +299,16 @@ impl Snapshot {
             })
             .collect();
         let direct_disjunction = is_flat_disjunction(query);
+        let direct_conjunction = is_flat_conjunction(query);
+        let phrase_order = match query {
+            Query::Phrase(phrase) if phrase.len() == scoring_terms.len() => Some(
+                phrase
+                    .iter()
+                    .map(|term| terms.binary_search(term).unwrap())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
         let avgdl = if self.live_docs == 0 {
             1.0
         } else {
@@ -342,6 +352,31 @@ impl Snapshot {
                         })
                     })
                     .collect();
+                if direct_disjunction && scoring_terms.len() == 1 && cursors.len() == 1 {
+                    self.single_list_segment(
+                        segment_index,
+                        &cursors[0],
+                        avgdl,
+                        options,
+                        &mut ranked,
+                        &mut stats,
+                    );
+                    continue;
+                }
+                if direct_conjunction || phrase_order.is_some() {
+                    if cursors.len() == scoring_terms.len() {
+                        self.intersect_segment(
+                            segment_index,
+                            &mut cursors,
+                            phrase_order.as_deref(),
+                            avgdl,
+                            options,
+                            &mut ranked,
+                            &mut stats,
+                        );
+                    }
+                    continue;
+                }
                 sort_cursors(&mut cursors);
 
                 while !cursors.is_empty() {
@@ -517,6 +552,111 @@ impl Snapshot {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn intersect_segment(
+        &self,
+        segment_index: usize,
+        cursors: &mut [WandCursor<'_>],
+        phrase_order: Option<&[usize]>,
+        avgdl: f32,
+        options: SearchOptions,
+        ranked: &mut TopK,
+        stats: &mut SearchStats,
+    ) {
+        while cursors.iter().all(|cursor| !cursor.exhausted()) {
+            let mut target = cursors.iter().map(WandCursor::docid).max().unwrap();
+            let mut aligned = false;
+            while !aligned {
+                aligned = true;
+                for cursor in cursors.iter_mut() {
+                    if cursor.docid() < target {
+                        stats.skipped_blocks += cursor.advance_to(target);
+                        if cursor.exhausted() {
+                            return;
+                        }
+                    }
+                    if cursor.docid() > target {
+                        target = cursor.docid();
+                        aligned = false;
+                    }
+                }
+            }
+
+            stats.candidate_docs += 1;
+            if self.is_live(segment_index, target)
+                && phrase_order.is_none_or(|order| cursor_phrase_matches(cursors, order))
+            {
+                stats.scored_docs += 1;
+                let doc = &self.segments[segment_index].docs[target as usize];
+                let budget = bm25_budget(doc.len, avgdl, options);
+                let score = cursors
+                    .iter()
+                    .map(|cursor| {
+                        bm25_with_budget(
+                            cursor.idf,
+                            cursor.list.freqs[cursor.index],
+                            budget,
+                            options.k1,
+                        )
+                    })
+                    .sum();
+                ranked.push(RankedDoc {
+                    segment: segment_index,
+                    docid: target,
+                    rowid: doc.rowid,
+                    score,
+                });
+            }
+            for cursor in cursors.iter_mut() {
+                cursor.index += 1;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn single_list_segment(
+        &self,
+        segment_index: usize,
+        cursor: &WandCursor<'_>,
+        avgdl: f32,
+        options: SearchOptions,
+        ranked: &mut TopK,
+        stats: &mut SearchStats,
+    ) {
+        for (block_index, block) in cursor.list.blocks.iter().enumerate() {
+            stats.posting_blocks += 1;
+            let exact_bound = bm25(cursor.idf, block.max_tf, block.min_doc_len, avgdl, options);
+            let block_bound =
+                dequantize_upper(quantize_upper(exact_bound, cursor.scale), cursor.scale);
+            if ranked.is_full() && block_bound < ranked.threshold() {
+                stats.skipped_blocks += 1;
+                continue;
+            }
+            let start = block_index * POSTING_BLOCK_SIZE;
+            for index in start..block.end as usize {
+                let docid = cursor.list.docids[index];
+                stats.candidate_docs += 1;
+                if !self.is_live(segment_index, docid) {
+                    continue;
+                }
+                stats.scored_docs += 1;
+                let doc = &self.segments[segment_index].docs[docid as usize];
+                ranked.push(RankedDoc {
+                    segment: segment_index,
+                    docid,
+                    rowid: doc.rowid,
+                    score: bm25(
+                        cursor.idf,
+                        cursor.list.freqs[index],
+                        doc.len,
+                        avgdl,
+                        options,
+                    ),
+                });
+            }
+        }
+    }
+
     fn idf(&self, term: &str) -> f32 {
         let n = self.live_docs as f32;
         let df = self.term_df.get(term).copied().unwrap_or(0) as f32;
@@ -571,6 +711,28 @@ fn is_flat_disjunction(query: &Query) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_flat_conjunction(query: &Query) -> bool {
+    matches!(query, Query::And(children)
+        if !children.is_empty() && children.iter().all(|child| matches!(child, Query::Term(_))))
+}
+
+fn cursor_phrase_matches(cursors: &[WandCursor<'_>], phrase_order: &[usize]) -> bool {
+    let first_cursor = &cursors[phrase_order[0]];
+    let first = &first_cursor.list.positions[first_cursor.index];
+    first.iter().any(|start| {
+        let column = start >> COLUMN_SHIFT;
+        phrase_order[1..]
+            .iter()
+            .enumerate()
+            .all(|(offset, ordinal)| {
+                let cursor = &cursors[*ordinal];
+                let positions = &cursor.list.positions[cursor.index];
+                let target = start.saturating_add(offset as u32 + 1);
+                target >> COLUMN_SHIFT == column && positions.binary_search(&target).is_ok()
+            })
+    })
 }
 
 fn matches_query_in_column(

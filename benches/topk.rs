@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use kestrel::{Database, DatabaseConfig, Query, SearchOptions};
+use kestrel::{Database, DatabaseConfig, Query, SearchOptions, SearchResult};
 
 fn main() -> kestrel::Result<()> {
     let nonce = SystemTime::now()
@@ -38,36 +38,68 @@ fn main() -> kestrel::Result<()> {
     }
     let build_time = build_start.elapsed();
 
-    let query = Query::or([
-        Query::term("kestrel"),
-        Query::term("rust"),
-        Query::term("common"),
-    ]);
     let options = SearchOptions {
         limit: 10,
         cache: false,
         ..Default::default()
     };
-    let iterations = 100;
-    let started = Instant::now();
-    let mut last = None;
-    for _ in 0..iterations {
-        last = Some(black_box(db.search(&query, options)?));
-    }
-    let elapsed = started.elapsed();
-    let result = last.unwrap();
-    let per_query = elapsed / iterations;
-
     println!("documents:       {DOCS}");
     println!("build:           {}", format_duration(build_time));
-    println!("query mean:      {}", format_duration(per_query));
-    println!("posting blocks:  {}", result.stats.posting_blocks);
-    println!("skipped blocks:  {}", result.stats.skipped_blocks);
-    println!("candidate docs:  {}", result.stats.candidate_docs);
-    println!("scored docs:     {}", result.stats.scored_docs);
+    println!("workload                 mean       candidates  scored  skipped");
+    bench_query(
+        &db,
+        "or-common",
+        Query::or([
+            Query::term("kestrel"),
+            Query::term("rust"),
+            Query::term("common"),
+        ]),
+        options,
+    )?;
+    bench_query(&db, "rare-term", Query::term("kestrel"), options)?;
+    bench_query(
+        &db,
+        "and-common",
+        Query::and([Query::term("common"), Query::term("rust")]),
+        options,
+    )?;
+    bench_query(
+        &db,
+        "phrase-common",
+        Query::phrase(["database", "embedded"]),
+        options,
+    )?;
+    bench_query(&db, "prefix", Query::prefix("eng"), options)?;
 
     drop(db);
     let _ = fs::remove_dir_all(path);
+    Ok(())
+}
+
+fn bench_query(
+    db: &Database,
+    name: &str,
+    query: Query,
+    options: SearchOptions,
+) -> kestrel::Result<()> {
+    const ITERATIONS: u32 = 100;
+    for _ in 0..10 {
+        black_box(db.search(&query, options)?);
+    }
+    let started = Instant::now();
+    let mut last: Option<SearchResult> = None;
+    for _ in 0..ITERATIONS {
+        last = Some(black_box(db.search(&query, options)?));
+    }
+    let elapsed = started.elapsed() / ITERATIONS;
+    let stats = last.unwrap().stats;
+    println!(
+        "{name:<22} {:>10} {:>12} {:>7} {:>8}",
+        format_duration(elapsed),
+        stats.candidate_docs,
+        stats.scored_docs,
+        stats.skipped_blocks,
+    );
     Ok(())
 }
 
