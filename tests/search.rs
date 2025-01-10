@@ -228,6 +228,108 @@ fn concurrent_readers_share_sharded_cache() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[test]
+fn randomized_pruning_matches_exhaustive_across_segments_and_updates() {
+    let path = temp_dir("random-differential");
+    let db = Database::open(&path).unwrap();
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+
+    for batch in 0..6_i64 {
+        let mut tx = db.begin();
+        for offset in 0..200_i64 {
+            let rowid = batch * 200 + offset;
+            tx.upsert_text(rowid, random_document(&mut state)).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let mut mutations = db.begin();
+    for rowid in (0..180_i64).step_by(3) {
+        mutations
+            .upsert_text(rowid, random_document(&mut state))
+            .unwrap();
+    }
+    for rowid in (1..180_i64).step_by(7) {
+        mutations.delete(rowid).unwrap();
+    }
+    mutations.commit().unwrap();
+
+    for round in 0..200 {
+        let left = format!("t{:02}", next_random(&mut state) % 32);
+        let right = format!("t{:02}", next_random(&mut state) % 32);
+        let query = match round % 6 {
+            0 => Query::term(&left),
+            1 => Query::or([Query::term(&left), Query::term(&right)]),
+            2 => Query::and([Query::term(&left), Query::term(&right)]),
+            3 => Query::phrase([&left, &right]),
+            4 => Query::prefix(format!("t{}", next_random(&mut state) % 3)),
+            _ => Query::and([Query::term(&left), Query::negate(Query::term(&right))]),
+        };
+        let options = SearchOptions {
+            limit: (next_random(&mut state) as usize % 20) + 1,
+            cache: false,
+            ..Default::default()
+        };
+        let fast = db.search(&query, options).unwrap();
+        let exhaustive = db.search_exhaustive(&query, options).unwrap();
+        assert_eq!(
+            fast.hits
+                .iter()
+                .map(|hit| (hit.rowid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            exhaustive
+                .hits
+                .iter()
+                .map(|hit| (hit.rowid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            "query {query:?}"
+        );
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn equal_scores_keep_smallest_rowids_across_commit_order() {
+    let path = temp_dir("ties");
+    let db = Database::open(&path).unwrap();
+    for rowids in [(100..200).collect::<Vec<_>>(), (0..100).collect()] {
+        let mut tx = db.begin();
+        for rowid in rowids {
+            tx.upsert_text(rowid, "identical").unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let result = db
+        .search(
+            &Query::term("identical"),
+            SearchOptions {
+                limit: 10,
+                cache: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result.hits.iter().map(|hit| hit.rowid).collect::<Vec<_>>(),
+        (0..10).collect::<Vec<_>>()
+    );
+    fs::remove_dir_all(path).unwrap();
+}
+
+fn random_document(state: &mut u64) -> String {
+    let terms = 5 + (next_random(state) % 20);
+    (0..terms)
+        .map(|_| format!("t{:02}", next_random(state) % 32))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
+}
+
 fn ids(db: &Database, query: &Query) -> Vec<i64> {
     let mut ids: Vec<_> = db
         .search(
