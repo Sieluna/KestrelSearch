@@ -315,6 +315,77 @@ fn equal_scores_keep_smallest_rowids_across_commit_order() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[test]
+fn native_checkpoint_preserves_exact_queries_after_reopen() {
+    let path = temp_dir("native-reopen-differential");
+    let db = Database::open(&path).unwrap();
+    for batch in 0..5_i64 {
+        let mut tx = db.begin();
+        for offset in 0..240_i64 {
+            let rowid = batch * 240 + offset;
+            let text = format!(
+                "common t{:02} t{:02} ordered phrase{}",
+                rowid % 29,
+                (rowid * 7) % 29,
+                rowid % 13
+            );
+            tx.upsert_text(rowid, text).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let mut changes = db.begin();
+    for rowid in (0..300_i64).step_by(11) {
+        changes
+            .upsert_text(rowid, format!("replacement t{:02} exact", rowid % 29))
+            .unwrap();
+    }
+    for rowid in (3..300_i64).step_by(17) {
+        changes.delete(rowid).unwrap();
+    }
+    changes.commit().unwrap();
+
+    let queries = [
+        Query::term("common"),
+        Query::or([Query::term("t03"), Query::term("t17")]),
+        Query::and([Query::term("common"), Query::term("t09")]),
+        Query::phrase(["ordered", "phrase4"]),
+        Query::prefix("t2"),
+        Query::near(["common", "ordered"], 3),
+    ];
+    let options = SearchOptions {
+        limit: 37,
+        cache: false,
+        ..Default::default()
+    };
+    let expected: Vec<_> = queries
+        .iter()
+        .map(|query| {
+            db.search(query, options)
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|hit| (hit.rowid, hit.score.to_bits(), hit.fields))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    db.optimize().unwrap();
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    for (query, expected) in queries.iter().zip(expected) {
+        let actual = reopened
+            .search(query, options)
+            .unwrap()
+            .hits
+            .into_iter()
+            .map(|hit| (hit.rowid, hit.score.to_bits(), hit.fields))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "query {query:?}");
+    }
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
+}
+
 fn random_document(state: &mut u64) -> String {
     let terms = 5 + (next_random(state) % 20);
     (0..terms)

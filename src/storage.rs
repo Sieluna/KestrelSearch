@@ -16,12 +16,13 @@ use crate::{
     codec::{
         checksum, put_bytes, put_i64, put_u32, put_u64, read_bytes, read_i64, read_u32, read_u64,
     },
-    index::Snapshot,
+    index::{BlockMeta, Location, PostingList, Segment, Snapshot, StoredDocument},
 };
 
 const WAL_MAGIC: &[u8; 8] = b"KSTWAL01";
-const SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG01";
-const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
+const LEGACY_SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG01";
+const SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG02";
+const MAX_WAL_RECORD_BYTES: usize = 256 * 1024 * 1024;
 
 type WalCommit = (u64, Vec<Operation>);
 type WalContents = (Vec<WalCommit>, u64);
@@ -196,29 +197,13 @@ impl Database {
         self.len() == 0
     }
 
-    /// Writes one immutable, checksummed checkpoint containing only live documents,
-    /// then publishes the compacted in-memory segment. The append-only WAL remains
-    /// an audit/recovery log; records at or below the checkpoint generation are skipped.
+    /// Writes one immutable, checksummed, query-ready checkpoint containing only
+    /// live documents, then publishes the compacted in-memory segment.
     pub fn optimize(&self) -> Result<()> {
         let _writer = self.inner.writer.lock().unwrap();
         let current = self.snapshot();
         let compacted = current.compacted();
-        let mut operations: Vec<_> = compacted
-            .latest
-            .values()
-            .filter(|location| !location.deleted)
-            .map(|location| {
-                let doc = &compacted.segments[location.segment].docs[location.docid as usize];
-                Operation::Upsert {
-                    rowid: doc.rowid,
-                    fields: doc.fields.clone(),
-                }
-            })
-            .collect();
-        operations.sort_by_key(|operation| match operation {
-            Operation::Upsert { rowid, .. } | Operation::Delete { rowid } => *rowid,
-        });
-        let payload = encode_commit(compacted.generation, &operations)?;
+        let payload = encode_snapshot(&compacted)?;
         let nonce = self.inner.checkpoint_nonce.fetch_add(1, Ordering::Relaxed);
         let temp = self
             .inner
@@ -491,6 +476,243 @@ fn decode_commit(mut payload: &[u8]) -> Result<(u64, Vec<Operation>)> {
     Ok((generation, operations))
 }
 
+fn put_len(out: &mut Vec<u8>, len: usize, what: &'static str) -> Result<()> {
+    let len = u32::try_from(len)
+        .map_err(|_| Error::InvalidInput(format!("{what} count exceeds 32-bit format limit")))?;
+    put_u32(out, len);
+    Ok(())
+}
+
+fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    put_u64(&mut payload, snapshot.generation);
+    put_len(&mut payload, snapshot.segments.len(), "segment")?;
+    for segment in &snapshot.segments {
+        put_len(&mut payload, segment.docs.len(), "document")?;
+        for doc in &segment.docs {
+            put_i64(&mut payload, doc.rowid);
+            put_u32(&mut payload, doc.len);
+            put_len(&mut payload, doc.fields.len(), "field")?;
+            for field in &doc.fields {
+                put_bytes(&mut payload, field.as_bytes())?;
+            }
+        }
+
+        put_len(&mut payload, segment.terms.len(), "term")?;
+        for (term, list) in &segment.terms {
+            put_bytes(&mut payload, term.as_bytes())?;
+            put_len(&mut payload, list.docids.len(), "posting")?;
+            for index in 0..list.docids.len() {
+                put_u32(&mut payload, list.docids[index]);
+                put_u32(&mut payload, list.freqs[index]);
+                put_len(&mut payload, list.positions[index].len(), "position")?;
+                for position in &list.positions[index] {
+                    put_u32(&mut payload, *position);
+                }
+            }
+            put_len(&mut payload, list.blocks.len(), "block")?;
+            for block in &list.blocks {
+                put_u32(&mut payload, block.end);
+                put_u32(&mut payload, block.last_docid);
+                put_u32(&mut payload, block.max_tf);
+                put_u32(&mut payload, block.min_doc_len);
+            }
+            put_u32(&mut payload, list.max_tf);
+            put_u32(&mut payload, list.min_doc_len);
+        }
+    }
+    Ok(payload)
+}
+
+fn read_count(input: &mut &[u8], minimum_bytes: usize, message: &'static str) -> Result<usize> {
+    let count = read_u32(input)? as usize;
+    if minimum_bytes != 0 && count > input.len() / minimum_bytes {
+        return Err(Error::Corrupt(message));
+    }
+    Ok(count)
+}
+
+fn decode_snapshot(mut payload: &[u8]) -> Result<Snapshot> {
+    let generation = read_u64(&mut payload)?;
+    let segment_count = read_count(&mut payload, 4, "invalid segment count")?;
+    let mut segments = Vec::with_capacity(segment_count);
+
+    for _ in 0..segment_count {
+        let doc_count = read_count(&mut payload, 16, "invalid document count")?;
+        let mut docs = Vec::with_capacity(doc_count);
+        for _ in 0..doc_count {
+            let rowid = read_i64(&mut payload)?;
+            let len = read_u32(&mut payload)?;
+            let field_count = read_count(&mut payload, 4, "invalid field count")?;
+            if field_count == 0 || field_count > 64 {
+                return Err(Error::Corrupt("invalid field count"));
+            }
+            let mut fields = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                let field = read_bytes(&mut payload)?;
+                fields.push(
+                    String::from_utf8(field.to_vec())
+                        .map_err(|_| Error::Corrupt("field is not UTF-8"))?,
+                );
+            }
+            docs.push(StoredDocument {
+                rowid,
+                fields,
+                len,
+                unique_terms: Vec::new(),
+            });
+        }
+
+        let term_count = read_count(&mut payload, 4, "invalid term count")?;
+        let mut terms = std::collections::BTreeMap::new();
+        for _ in 0..term_count {
+            let term = String::from_utf8(read_bytes(&mut payload)?.to_vec())
+                .map_err(|_| Error::Corrupt("term is not UTF-8"))?;
+            if term.is_empty() || terms.contains_key(&term) {
+                return Err(Error::Corrupt("invalid or duplicate term"));
+            }
+            let posting_count = read_count(&mut payload, 12, "invalid posting count")?;
+            if posting_count == 0 || posting_count > doc_count {
+                return Err(Error::Corrupt("invalid posting count"));
+            }
+            let mut list = PostingList {
+                docids: Vec::with_capacity(posting_count),
+                freqs: Vec::with_capacity(posting_count),
+                positions: Vec::with_capacity(posting_count),
+                blocks: Vec::new(),
+                max_tf: 0,
+                min_doc_len: 0,
+            };
+            for _ in 0..posting_count {
+                let docid = read_u32(&mut payload)?;
+                let frequency = read_u32(&mut payload)?;
+                if docid as usize >= doc_count
+                    || list
+                        .docids
+                        .last()
+                        .is_some_and(|previous| *previous >= docid)
+                {
+                    return Err(Error::Corrupt("posting docids are invalid"));
+                }
+                let position_count = read_count(&mut payload, 4, "invalid position count")?;
+                if frequency == 0 || position_count != frequency as usize {
+                    return Err(Error::Corrupt("posting frequency does not match positions"));
+                }
+                let mut positions = Vec::with_capacity(position_count);
+                for _ in 0..position_count {
+                    let position = read_u32(&mut payload)?;
+                    if positions
+                        .last()
+                        .is_some_and(|previous| *previous >= position)
+                    {
+                        return Err(Error::Corrupt("posting positions are not increasing"));
+                    }
+                    positions.push(position);
+                }
+                docs[docid as usize].unique_terms.push(term.clone());
+                list.docids.push(docid);
+                list.freqs.push(frequency);
+                list.positions.push(positions);
+            }
+
+            let block_count = read_count(&mut payload, 16, "invalid block count")?;
+            let expected_blocks = posting_count.div_ceil(crate::index::POSTING_BLOCK_SIZE);
+            if block_count != expected_blocks {
+                return Err(Error::Corrupt("invalid block count"));
+            }
+            list.blocks.reserve(block_count);
+            for block_index in 0..block_count {
+                let block = BlockMeta {
+                    end: read_u32(&mut payload)?,
+                    last_docid: read_u32(&mut payload)?,
+                    max_tf: read_u32(&mut payload)?,
+                    min_doc_len: read_u32(&mut payload)?,
+                };
+                let expected_end =
+                    ((block_index + 1) * crate::index::POSTING_BLOCK_SIZE).min(posting_count);
+                let expected_start = block_index * crate::index::POSTING_BLOCK_SIZE;
+                let expected_max_tf = list.freqs[expected_start..expected_end]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap();
+                let expected_min_doc_len = list.docids[expected_start..expected_end]
+                    .iter()
+                    .map(|docid| docs[*docid as usize].len)
+                    .min()
+                    .unwrap();
+                if block.end as usize != expected_end
+                    || block.last_docid != list.docids[expected_end - 1]
+                    || block.max_tf != expected_max_tf
+                    || block.min_doc_len != expected_min_doc_len
+                {
+                    return Err(Error::Corrupt("invalid block metadata"));
+                }
+                list.blocks.push(block);
+            }
+            list.max_tf = read_u32(&mut payload)?;
+            list.min_doc_len = read_u32(&mut payload)?;
+            let expected_max_tf = list.freqs.iter().copied().max().unwrap();
+            let expected_min_doc_len = list
+                .docids
+                .iter()
+                .map(|docid| docs[*docid as usize].len)
+                .min()
+                .unwrap();
+            if list.max_tf != expected_max_tf || list.min_doc_len != expected_min_doc_len {
+                return Err(Error::Corrupt("invalid posting-list metadata"));
+            }
+            terms.insert(term, list);
+        }
+        segments.push(Arc::new(Segment { docs, terms }));
+    }
+    if !payload.is_empty() {
+        return Err(Error::Corrupt("trailing checkpoint bytes"));
+    }
+
+    let mut snapshot = Snapshot {
+        generation,
+        segments,
+        latest: HashMap::new(),
+        live_masks: Vec::new(),
+        term_df: HashMap::new(),
+        live_docs: 0,
+        total_doc_len: 0,
+    };
+    for (segment_index, segment) in snapshot.segments.iter().enumerate() {
+        let words = segment.docs.len().div_ceil(64);
+        let mut live_mask = vec![u64::MAX; words];
+        if let Some(last) = live_mask.last_mut()
+            && segment.docs.len() % 64 != 0
+        {
+            *last = (1_u64 << (segment.docs.len() % 64)) - 1;
+        }
+        snapshot.live_masks.push(Arc::new(live_mask));
+        for (docid, doc) in segment.docs.iter().enumerate() {
+            if snapshot
+                .latest
+                .insert(
+                    doc.rowid,
+                    Location {
+                        segment: segment_index,
+                        docid: docid as u32,
+                        deleted: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::Corrupt("duplicate rowid in checkpoint"));
+            }
+            snapshot.live_docs += 1;
+            snapshot.total_doc_len += u64::from(doc.len);
+            for term in &doc.unique_terms {
+                *snapshot.term_df.entry(term.clone()).or_default() += 1;
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
 fn encode_frame(magic: &[u8; 8], payload: &[u8]) -> Result<Vec<u8>> {
     let len = u32::try_from(payload.len())
         .map_err(|_| Error::InvalidInput("transaction exceeds 4 GiB".to_owned()))?;
@@ -527,7 +749,7 @@ fn read_wal(file: &mut File) -> Result<WalContents> {
         }
         let len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
         let expected = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
-        if len > MAX_RECORD_BYTES {
+        if len > MAX_WAL_RECORD_BYTES {
             return Err(Error::Corrupt("WAL record exceeds safety limit"));
         }
         let end = offset + 16 + len;
@@ -566,18 +788,14 @@ fn load_latest_checkpoint(path: &Path) -> Result<Option<Snapshot>> {
 
     let mut best: Option<Snapshot> = None;
     for candidate in candidates {
-        let Ok((generation, operations)) = read_checkpoint(&candidate) else {
+        let Ok(snapshot) = read_checkpoint(&candidate) else {
             continue;
         };
         if best
             .as_ref()
-            .is_none_or(|current| generation > current.generation)
+            .is_none_or(|current| snapshot.generation > current.generation)
         {
-            best = Some(apply_operations(
-                &Snapshot::default(),
-                generation,
-                operations,
-            ));
+            best = Some(snapshot);
         }
     }
     Ok(best)
@@ -599,22 +817,31 @@ fn remove_old_checkpoints(directory: &Path, keep: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_checkpoint(path: &Path) -> Result<(u64, Vec<Operation>)> {
+fn read_checkpoint(path: &Path) -> Result<Snapshot> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
-    if bytes.len() < 16 || &bytes[..8] != SEGMENT_MAGIC {
+    if bytes.len() < 16 || (&bytes[..8] != SEGMENT_MAGIC && &bytes[..8] != LEGACY_SEGMENT_MAGIC) {
         return Err(Error::Corrupt("invalid checkpoint header"));
     }
     let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let expected = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-    if len > MAX_RECORD_BYTES || bytes.len() != 16 + len {
+    if bytes.len() != 16 + len {
         return Err(Error::Corrupt("invalid checkpoint length"));
     }
     let payload = &bytes[16..];
     if checksum(payload) != expected {
         return Err(Error::Corrupt("checkpoint checksum mismatch"));
     }
-    decode_commit(payload)
+    if &bytes[..8] == LEGACY_SEGMENT_MAGIC {
+        let (generation, operations) = decode_commit(payload)?;
+        Ok(apply_operations(
+            &Snapshot::default(),
+            generation,
+            operations,
+        ))
+    } else {
+        decode_snapshot(payload)
+    }
 }
 
 #[cfg(test)]
@@ -716,6 +943,18 @@ mod tests {
             tx.commit().unwrap();
             db.optimize().unwrap();
             assert_eq!(fs::metadata(path.join("kestrel.wal")).unwrap().len(), 0);
+            assert_eq!(
+                &fs::read(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .filter_map(std::result::Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| path.extension().is_some_and(|ext| ext == "kst"))
+                        .unwrap()
+                )
+                .unwrap()[..8],
+                SEGMENT_MAGIC
+            );
 
             let mut after_checkpoint = db.begin();
             after_checkpoint
@@ -744,6 +983,72 @@ mod tests {
         assert_eq!(reopened.generation(), 4);
         assert_eq!(reopened.len(), 4);
         drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn native_checkpoint_restores_query_ready_postings() {
+        let path = temp_dir("native-checkpoint");
+        fs::create_dir_all(&path).unwrap();
+        let mut snapshot = Snapshot::default().with_commit(
+            9,
+            vec![
+                (1, vec!["alpha beta beta".to_owned()]),
+                (2, vec!["alpha gamma".to_owned()]),
+            ],
+            Vec::new(),
+        );
+        Arc::make_mut(&mut snapshot.segments[0]).docs[0].fields[0] =
+            "stored field deliberately differs".to_owned();
+        let payload = encode_snapshot(&snapshot).unwrap();
+        let checkpoint = path.join("segment-9-native.kst");
+        write_framed_file(&checkpoint, SEGMENT_MAGIC, &payload).unwrap();
+
+        let restored = read_checkpoint(&checkpoint).unwrap();
+        let options = SearchOptions {
+            cache: false,
+            ..SearchOptions::default()
+        };
+        let result = restored.search(&Query::term("beta"), options, false);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].rowid, 1);
+        assert_eq!(result.hits[0].fields, ["stored field deliberately differs"]);
+        assert!(
+            restored
+                .search(&Query::term("deliberately"), options, false)
+                .hits
+                .is_empty()
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_document_checkpoint_remains_readable() {
+        let path = temp_dir("legacy-checkpoint");
+        fs::create_dir_all(&path).unwrap();
+        let operations = vec![Operation::Upsert {
+            rowid: 41,
+            fields: vec!["legacy searchable checkpoint".to_owned()],
+        }];
+        let payload = encode_commit(7, &operations).unwrap();
+        write_framed_file(
+            &path.join("segment-7-legacy.kst"),
+            LEGACY_SEGMENT_MAGIC,
+            &payload,
+        )
+        .unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.generation(), 7);
+        assert_eq!(db.get(41).unwrap(), ["legacy searchable checkpoint"]);
+        assert_eq!(
+            db.search(&Query::term("searchable"), SearchOptions::default())
+                .unwrap()
+                .hits[0]
+                .rowid,
+            41
+        );
+        drop(db);
         fs::remove_dir_all(path).unwrap();
     }
 }
