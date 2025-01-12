@@ -55,6 +55,12 @@ struct Inner {
     checkpoint_nonce: AtomicU64,
 }
 
+struct PreparedCommit {
+    wal_payload: Vec<u8>,
+    segment: Option<Arc<Segment>>,
+    deletes: Vec<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
     Upsert { rowid: i64, fields: Vec<String> },
@@ -239,14 +245,18 @@ impl Database {
             return Ok(self.generation());
         }
         validate_operations(&operations)?;
+        // Canonicalization, WAL encoding, tokenization, and posting construction
+        // do not depend on the current snapshot. Keep them outside the serialized
+        // durability/publication section so concurrent writers only contend on I/O.
+        let mut prepared = prepare_commit(operations)?;
         let _writer = self.inner.writer.lock().unwrap();
         let current = self.snapshot();
         let generation = current
             .generation
             .checked_add(1)
             .ok_or_else(|| Error::InvalidInput("generation counter exhausted".to_owned()))?;
-        let payload = encode_commit(generation, &operations)?;
-        let frame = encode_frame(WAL_MAGIC, &payload)?;
+        prepared.wal_payload[..8].copy_from_slice(&generation.to_le_bytes());
+        let frame = encode_frame(WAL_MAGIC, &prepared.wal_payload)?;
 
         {
             let mut wal = self.inner.wal.lock().unwrap();
@@ -255,7 +265,7 @@ impl Database {
             wal.sync_data()?;
         }
 
-        let next = apply_operations(&current, generation, operations);
+        let next = current.with_prebuilt_commit(generation, prepared.segment, prepared.deletes);
         *self.inner.snapshot.write().unwrap() = Arc::new(next);
         self.inner.cache.clear();
         Ok(generation)
@@ -389,6 +399,28 @@ fn validate_operations(operations: &[Operation]) -> Result<()> {
 }
 
 fn apply_operations(snapshot: &Snapshot, generation: u64, operations: Vec<Operation>) -> Snapshot {
+    let ordered = canonicalize_operations(operations);
+    let (docs, deletes) = split_operations(ordered);
+    snapshot.with_commit(generation, docs, deletes)
+}
+
+fn prepare_commit(operations: Vec<Operation>) -> Result<PreparedCommit> {
+    let ordered = canonicalize_operations(operations);
+    let wal_payload = encode_commit(0, &ordered)?;
+    let (docs, deletes) = split_operations(ordered);
+    let segment = if docs.is_empty() {
+        None
+    } else {
+        Some(Arc::new(Segment::build(docs)))
+    };
+    Ok(PreparedCommit {
+        wal_payload,
+        segment,
+        deletes,
+    })
+}
+
+fn canonicalize_operations(operations: Vec<Operation>) -> Vec<Operation> {
     // Last operation for a rowid wins inside a transaction.
     let mut last = HashMap::<i64, Operation>::new();
     for operation in operations {
@@ -401,6 +433,10 @@ fn apply_operations(snapshot: &Snapshot, generation: u64, operations: Vec<Operat
     ordered.sort_by_key(|operation| match operation {
         Operation::Upsert { rowid, .. } | Operation::Delete { rowid } => *rowid,
     });
+    ordered
+}
+
+fn split_operations(ordered: Vec<Operation>) -> (Vec<(i64, Vec<String>)>, Vec<i64>) {
     let mut docs = Vec::new();
     let mut deletes = Vec::new();
     for operation in ordered {
@@ -409,7 +445,7 @@ fn apply_operations(snapshot: &Snapshot, generation: u64, operations: Vec<Operat
             Operation::Delete { rowid } => deletes.push(rowid),
         }
     }
-    snapshot.with_commit(generation, docs, deletes)
+    (docs, deletes)
 }
 
 fn encode_commit(generation: u64, operations: &[Operation]) -> Result<Vec<u8>> {

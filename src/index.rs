@@ -201,6 +201,20 @@ impl Snapshot {
         docs: Vec<(i64, Vec<String>)>,
         deletes: Vec<i64>,
     ) -> Self {
+        let segment = if docs.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(Segment::build(docs)))
+        };
+        self.with_prebuilt_commit(generation, segment, deletes)
+    }
+
+    pub fn with_prebuilt_commit(
+        &self,
+        generation: u64,
+        segment: Option<std::sync::Arc<Segment>>,
+        deletes: Vec<i64>,
+    ) -> Self {
         let mut next = self.clone();
         next.generation = generation;
         next.latest = self.latest.clone();
@@ -218,9 +232,8 @@ impl Snapshot {
             );
         }
 
-        if !docs.is_empty() {
+        if let Some(segment) = segment {
             let segment_index = next.segments.len();
-            let segment = std::sync::Arc::new(Segment::build(docs));
             for (docid, doc) in segment.docs.iter().enumerate() {
                 next.remove_latest(doc.rowid);
                 next.live_docs += 1;

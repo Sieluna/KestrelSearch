@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Barrier},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -223,6 +223,45 @@ fn concurrent_readers_share_sharded_cache() {
         .collect();
     for reader in readers {
         reader.join().unwrap();
+    }
+    drop(db);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn concurrent_writers_publish_prebuilt_segments_without_lost_updates() {
+    let path = temp_dir("concurrent-writers");
+    let db = Arc::new(Database::open(&path).unwrap());
+    let barrier = Arc::new(Barrier::new(5));
+    let writers: Vec<_> = (0..4_i64)
+        .map(|writer| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut tx = db.begin();
+                for offset in 0..200_i64 {
+                    let rowid = writer * 1_000 + offset;
+                    tx.upsert_text(
+                        rowid,
+                        format!("writer{writer} shared prebuilt term{}", offset % 19),
+                    )
+                    .unwrap();
+                }
+                barrier.wait();
+                tx.commit().unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    let mut generations: Vec<_> = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect();
+    generations.sort_unstable();
+    assert_eq!(generations, [1, 2, 3, 4]);
+    assert_eq!(db.len(), 800);
+    for writer in 0..4 {
+        assert_eq!(ids(&db, &Query::term(format!("writer{writer}"))).len(), 100);
     }
     drop(db);
     fs::remove_dir_all(path).unwrap();
