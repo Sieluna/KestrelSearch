@@ -14,14 +14,17 @@ use std::{
 use crate::{
     Error, Query, Result, SearchOptions, SearchResult,
     codec::{
-        checksum, put_bytes, put_i64, put_u32, put_u64, read_bytes, read_i64, read_u32, read_u64,
+        checksum, put_bytes, put_i64, put_packed_deltas, put_packed_u32s, put_u32, put_u64,
+        put_var_u32, read_bytes, read_i64, read_packed_deltas, read_packed_u32s, read_u32,
+        read_u64, read_var_u32,
     },
     index::{BlockMeta, Location, PostingList, Segment, Snapshot, StoredDocument},
 };
 
 const WAL_MAGIC: &[u8; 8] = b"KSTWAL01";
 const LEGACY_SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG01";
-const SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG02";
+const NATIVE_V2_SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG02";
+const SEGMENT_MAGIC: &[u8; 8] = b"KSTSEG03";
 const MAX_WAL_RECORD_BYTES: usize = 256 * 1024 * 1024;
 
 type WalCommit = (u64, Vec<Operation>);
@@ -519,7 +522,26 @@ fn put_len(out: &mut Vec<u8>, len: usize, what: &'static str) -> Result<()> {
     Ok(())
 }
 
+fn put_section(
+    out: &mut Vec<u8>,
+    what: &'static str,
+    encode: impl FnOnce(&mut Vec<u8>),
+) -> Result<()> {
+    let length_offset = out.len();
+    put_u32(out, 0);
+    let start = out.len();
+    encode(out);
+    let len = u32::try_from(out.len() - start)
+        .map_err(|_| Error::InvalidInput(format!("{what} exceeds 4 GiB format limit")))?;
+    out[length_offset..length_offset + 4].copy_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
 fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
+    encode_snapshot_with_encoding(snapshot, true)
+}
+
+fn encode_snapshot_with_encoding(snapshot: &Snapshot, compressed: bool) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     put_u64(&mut payload, snapshot.generation);
     put_len(&mut payload, snapshot.segments.len(), "segment")?;
@@ -538,12 +560,35 @@ fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
         for (term, list) in &segment.terms {
             put_bytes(&mut payload, term.as_bytes())?;
             put_len(&mut payload, list.docids.len(), "posting")?;
-            for index in 0..list.docids.len() {
-                put_u32(&mut payload, list.docids[index]);
-                put_u32(&mut payload, list.freqs[index]);
-                put_len(&mut payload, list.positions[index].len(), "position")?;
-                for position in &list.positions[index] {
-                    put_u32(&mut payload, *position);
+            if compressed {
+                put_section(&mut payload, "docid section", |out| {
+                    put_packed_deltas(out, &list.docids);
+                })?;
+                put_section(&mut payload, "frequency section", |out| {
+                    put_packed_u32s(out, &list.freqs);
+                })?;
+                put_section(&mut payload, "position section", |out| {
+                    for positions in &list.positions {
+                        let mut previous = 0_u32;
+                        for (index, position) in positions.iter().copied().enumerate() {
+                            let delta = if index == 0 {
+                                position
+                            } else {
+                                position - previous
+                            };
+                            put_var_u32(out, delta);
+                            previous = position;
+                        }
+                    }
+                })?;
+            } else {
+                for index in 0..list.docids.len() {
+                    put_u32(&mut payload, list.docids[index]);
+                    put_u32(&mut payload, list.freqs[index]);
+                    put_len(&mut payload, list.positions[index].len(), "position")?;
+                    for position in &list.positions[index] {
+                        put_u32(&mut payload, *position);
+                    }
                 }
             }
             put_len(&mut payload, list.blocks.len(), "block")?;
@@ -568,7 +613,7 @@ fn read_count(input: &mut &[u8], minimum_bytes: usize, message: &'static str) ->
     Ok(count)
 }
 
-fn decode_snapshot(mut payload: &[u8]) -> Result<Snapshot> {
+fn decode_snapshot(mut payload: &[u8], compressed: bool) -> Result<Snapshot> {
     let generation = read_u64(&mut payload)?;
     let segment_count = read_count(&mut payload, 4, "invalid segment count")?;
     let mut segments = Vec::with_capacity(segment_count);
@@ -607,48 +652,93 @@ fn decode_snapshot(mut payload: &[u8]) -> Result<Snapshot> {
             if term.is_empty() || terms.contains_key(&term) {
                 return Err(Error::Corrupt("invalid or duplicate term"));
             }
-            let posting_count = read_count(&mut payload, 12, "invalid posting count")?;
+            let posting_count = read_count(
+                &mut payload,
+                if compressed { 0 } else { 12 },
+                "invalid posting count",
+            )?;
             if posting_count == 0 || posting_count > doc_count {
                 return Err(Error::Corrupt("invalid posting count"));
             }
             let mut list = PostingList {
-                docids: Vec::with_capacity(posting_count),
-                freqs: Vec::with_capacity(posting_count),
-                positions: Vec::with_capacity(posting_count),
+                docids: Vec::new(),
+                freqs: Vec::new(),
+                positions: Vec::new(),
                 blocks: Vec::new(),
                 max_tf: 0,
                 min_doc_len: 0,
             };
-            for _ in 0..posting_count {
-                let docid = read_u32(&mut payload)?;
-                let frequency = read_u32(&mut payload)?;
-                if docid as usize >= doc_count
-                    || list
-                        .docids
-                        .last()
-                        .is_some_and(|previous| *previous >= docid)
-                {
-                    return Err(Error::Corrupt("posting docids are invalid"));
-                }
-                let position_count = read_count(&mut payload, 4, "invalid position count")?;
-                if frequency == 0 || position_count != frequency as usize {
-                    return Err(Error::Corrupt("posting frequency does not match positions"));
-                }
-                let mut positions = Vec::with_capacity(position_count);
-                for _ in 0..position_count {
-                    let position = read_u32(&mut payload)?;
-                    if positions
-                        .last()
-                        .is_some_and(|previous| *previous >= position)
-                    {
-                        return Err(Error::Corrupt("posting positions are not increasing"));
+            if compressed {
+                list.docids = read_packed_deltas(read_bytes(&mut payload)?, posting_count)?;
+                list.freqs = read_packed_u32s(read_bytes(&mut payload)?, posting_count)?;
+                let mut encoded_positions = read_bytes(&mut payload)?;
+                list.positions.reserve(posting_count);
+                for frequency in &list.freqs {
+                    if *frequency == 0 || *frequency as usize > encoded_positions.len() {
+                        return Err(Error::Corrupt("invalid posting frequency"));
                     }
-                    positions.push(position);
+                    let mut positions = Vec::with_capacity(*frequency as usize);
+                    let mut previous = 0_u32;
+                    for index in 0..*frequency {
+                        let delta = read_var_u32(&mut encoded_positions)?;
+                        if index != 0 && delta == 0 {
+                            return Err(Error::Corrupt("zero position delta"));
+                        }
+                        let position = if index == 0 {
+                            delta
+                        } else {
+                            previous
+                                .checked_add(delta)
+                                .ok_or(Error::Corrupt("position delta overflow"))?
+                        };
+                        positions.push(position);
+                        previous = position;
+                    }
+                    list.positions.push(positions);
                 }
-                docs[docid as usize].unique_terms.push(term.clone());
-                list.docids.push(docid);
-                list.freqs.push(frequency);
-                list.positions.push(positions);
+                if !encoded_positions.is_empty() {
+                    return Err(Error::Corrupt("trailing position bytes"));
+                }
+            } else {
+                list.docids.reserve(posting_count);
+                list.freqs.reserve(posting_count);
+                list.positions.reserve(posting_count);
+                for _ in 0..posting_count {
+                    let docid = read_u32(&mut payload)?;
+                    let frequency = read_u32(&mut payload)?;
+                    if docid as usize >= doc_count
+                        || list
+                            .docids
+                            .last()
+                            .is_some_and(|previous| *previous >= docid)
+                    {
+                        return Err(Error::Corrupt("posting docids are invalid"));
+                    }
+                    let position_count = read_count(&mut payload, 4, "invalid position count")?;
+                    if frequency == 0 || position_count != frequency as usize {
+                        return Err(Error::Corrupt("posting frequency does not match positions"));
+                    }
+                    let mut positions = Vec::with_capacity(position_count);
+                    for _ in 0..position_count {
+                        let position = read_u32(&mut payload)?;
+                        if positions
+                            .last()
+                            .is_some_and(|previous| *previous >= position)
+                        {
+                            return Err(Error::Corrupt("posting positions are not increasing"));
+                        }
+                        positions.push(position);
+                    }
+                    list.docids.push(docid);
+                    list.freqs.push(frequency);
+                    list.positions.push(positions);
+                }
+            }
+            for docid in &list.docids {
+                if *docid as usize >= doc_count {
+                    return Err(Error::Corrupt("posting docid exceeds document count"));
+                }
+                docs[*docid as usize].unique_terms.push(term.clone());
             }
 
             let block_count = read_count(&mut payload, 16, "invalid block count")?;
@@ -823,9 +913,14 @@ fn load_latest_checkpoint(path: &Path) -> Result<Option<Snapshot>> {
     }
 
     let mut best: Option<Snapshot> = None;
+    let mut first_error = None;
     for candidate in candidates {
-        let Ok(snapshot) = read_checkpoint(&candidate) else {
-            continue;
+        let snapshot = match read_checkpoint(&candidate) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
         };
         if best
             .as_ref()
@@ -834,7 +929,11 @@ fn load_latest_checkpoint(path: &Path) -> Result<Option<Snapshot>> {
             best = Some(snapshot);
         }
     }
-    Ok(best)
+    match (best, first_error) {
+        (Some(snapshot), _) => Ok(Some(snapshot)),
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(None),
+    }
 }
 
 fn remove_old_checkpoints(directory: &Path, keep: &Path) -> Result<()> {
@@ -856,7 +955,11 @@ fn remove_old_checkpoints(directory: &Path, keep: &Path) -> Result<()> {
 fn read_checkpoint(path: &Path) -> Result<Snapshot> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
-    if bytes.len() < 16 || (&bytes[..8] != SEGMENT_MAGIC && &bytes[..8] != LEGACY_SEGMENT_MAGIC) {
+    if bytes.len() < 16
+        || (&bytes[..8] != SEGMENT_MAGIC
+            && &bytes[..8] != NATIVE_V2_SEGMENT_MAGIC
+            && &bytes[..8] != LEGACY_SEGMENT_MAGIC)
+    {
         return Err(Error::Corrupt("invalid checkpoint header"));
     }
     let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -876,7 +979,7 @@ fn read_checkpoint(path: &Path) -> Result<Snapshot> {
             operations,
         ))
     } else {
-        decode_snapshot(payload)
+        decode_snapshot(payload, &bytes[..8] == SEGMENT_MAGIC)
     }
 }
 
@@ -1085,6 +1188,84 @@ mod tests {
             41
         );
         drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn compressed_checkpoint_is_smaller_and_native_v2_remains_readable() {
+        let path = temp_dir("native-v2-checkpoint");
+        fs::create_dir_all(&path).unwrap();
+        let docs = (0..1_000_i64)
+            .map(|rowid| {
+                (
+                    rowid,
+                    vec![format!(
+                        "common alpha beta group{} group{}",
+                        rowid % 17,
+                        rowid % 31
+                    )],
+                )
+            })
+            .collect();
+        let snapshot = Snapshot::default().with_commit(12, docs, Vec::new());
+        let v2 = encode_snapshot_with_encoding(&snapshot, false).unwrap();
+        let v3 = encode_snapshot(&snapshot).unwrap();
+        assert!(
+            v3.len() * 5 < v2.len() * 3,
+            "compressed={} uncompressed={}",
+            v3.len(),
+            v2.len()
+        );
+
+        let checkpoint = path.join("segment-12-v2.kst");
+        write_framed_file(&checkpoint, NATIVE_V2_SEGMENT_MAGIC, &v2).unwrap();
+        let restored = read_checkpoint(&checkpoint).unwrap();
+        let options = SearchOptions {
+            limit: 25,
+            cache: false,
+            ..SearchOptions::default()
+        };
+        for query in [
+            Query::term("common"),
+            Query::and([Query::term("alpha"), Query::term("group3")]),
+            Query::phrase(["common", "alpha", "beta"]),
+        ] {
+            let expected = snapshot.search(&query, options, false);
+            let actual = restored.search(&query, options, false);
+            assert_eq!(
+                actual
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.rowid, hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                expected
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.rowid, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_rejects_a_directory_with_only_a_corrupt_checkpoint() {
+        let path = temp_dir("only-corrupt-checkpoint");
+        fs::create_dir_all(&path).unwrap();
+        let snapshot = Snapshot::default().with_commit(
+            3,
+            vec![(1, vec!["do not silently lose this".to_owned()])],
+            Vec::new(),
+        );
+        let payload = encode_snapshot(&snapshot).unwrap();
+        let checkpoint = path.join("segment-3-corrupt.kst");
+        write_framed_file(&checkpoint, SEGMENT_MAGIC, &payload).unwrap();
+        let mut bytes = fs::read(&checkpoint).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        fs::write(&checkpoint, bytes).unwrap();
+
+        assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));
         fs::remove_dir_all(path).unwrap();
     }
 }
