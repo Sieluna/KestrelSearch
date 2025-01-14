@@ -217,8 +217,6 @@ impl Snapshot {
     ) -> Self {
         let mut next = self.clone();
         next.generation = generation;
-        next.latest = self.latest.clone();
-        next.term_df = self.term_df.clone();
 
         for rowid in &deletes {
             next.remove_latest(*rowid);
