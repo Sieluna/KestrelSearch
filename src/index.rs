@@ -688,8 +688,17 @@ impl Snapshot {
                 terms.insert(term.clone());
             }
             Query::Prefix(prefix) if positive => {
-                for term in self.term_df.keys().filter(|term| term.starts_with(prefix)) {
-                    terms.insert(term.clone());
+                for segment in &self.segments {
+                    for term in segment
+                        .terms
+                        .range(prefix.clone()..)
+                        .map(|(term, _)| term)
+                        .take_while(|term| term.starts_with(prefix))
+                    {
+                        if self.term_df.contains_key(term) {
+                            terms.insert(term.clone());
+                        }
+                    }
                 }
             }
             Query::Phrase(phrase) | Query::Near { terms: phrase, .. } if positive => {

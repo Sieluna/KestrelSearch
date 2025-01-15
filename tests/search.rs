@@ -51,6 +51,23 @@ fn typed_boolean_phrase_prefix_and_delete() {
 }
 
 #[test]
+fn prefix_ranges_across_segments_ignore_terms_with_no_live_documents() {
+    let path = temp_dir("prefix-segment-ranges");
+    let db = Database::open(&path).unwrap();
+    let mut first = db.begin();
+    first.upsert_text(1, "apple obsolete").unwrap();
+    first.commit().unwrap();
+    let mut second = db.begin();
+    second.upsert_text(1, "banana replacement").unwrap();
+    second.upsert_text(2, "application live").unwrap();
+    second.commit().unwrap();
+
+    assert_eq!(ids(&db, &Query::prefix("app")), [2]);
+    drop(db);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn cjk_bigrams_are_searchable() {
     let path = temp_dir("cjk");
     let db = Database::open(&path).unwrap();
