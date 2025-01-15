@@ -1,7 +1,9 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap},
 };
+
+use hashbrown::{HashMap, HashSet};
 
 use crate::{
     query::{Query, SearchHit, SearchOptions, SearchResult, SearchStats},

@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{BuildHasher, Hash},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -10,6 +10,8 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use hashbrown::{DefaultHashBuilder, HashMap};
 
 use crate::{
     Error, Query, Result, SearchOptions, SearchResult,
@@ -92,6 +94,7 @@ struct QueryCache {
 
 struct CacheShards {
     shards: Box<[Mutex<QueryCache>]>,
+    hash_builder: DefaultHashBuilder,
 }
 
 impl Database {
@@ -359,7 +362,10 @@ impl CacheShards {
             .map(|_| Mutex::new(QueryCache::new(shard_capacity)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { shards }
+        Self {
+            shards,
+            hash_builder: DefaultHashBuilder::default(),
+        }
     }
 
     fn get(&self, key: &CacheKey) -> Option<SearchResult> {
@@ -377,9 +383,8 @@ impl CacheShards {
     }
 
     fn shard(&self, key: &CacheKey) -> &Mutex<QueryCache> {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        &self.shards[hasher.finish() as usize % self.shards.len()]
+        let hash = self.hash_builder.hash_one(key);
+        &self.shards[hash as usize % self.shards.len()]
     }
 }
 
