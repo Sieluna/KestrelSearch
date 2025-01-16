@@ -17,10 +17,14 @@ path = "src/main.rs"
 name = "topk"
 harness = false
 
+[[bench]]
+name = "storage"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
 panic = "abort"
 
 [dependencies]
-hashbrown = { version = "=0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
