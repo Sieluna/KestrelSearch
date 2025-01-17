@@ -284,13 +284,46 @@ impl Snapshot {
             .latest
             .values()
             .filter(|location| !location.deleted)
-            .map(|location| {
-                let doc = &self.segments[location.segment].docs[location.docid as usize];
-                (doc.rowid, doc.fields.clone())
-            })
+            .copied()
             .collect();
-        live.sort_by_key(|(rowid, _)| *rowid);
-        Snapshot::default().with_commit(self.generation, live, Vec::new())
+        live.sort_by_key(|location| {
+            self.segments[location.segment].docs[location.docid as usize].rowid
+        });
+
+        let mut compacted = Segment {
+            docs: Vec::with_capacity(live.len()),
+            terms: BTreeMap::new(),
+        };
+        for location in live {
+            let source_segment = &self.segments[location.segment];
+            let source_doc = &source_segment.docs[location.docid as usize];
+            let new_docid = compacted.docs.len() as u32;
+            for term in &source_doc.unique_terms {
+                let source_list = source_segment
+                    .terms
+                    .get(term)
+                    .expect("document term must have a posting list");
+                let source_index = source_list
+                    .find(location.docid)
+                    .expect("live document must occur in its posting list");
+                let target = compacted.terms.entry(term.clone()).or_default();
+                target.docids.push(new_docid);
+                target.freqs.push(source_list.freqs[source_index]);
+                target
+                    .positions
+                    .push(source_list.positions[source_index].clone());
+            }
+            compacted.docs.push(source_doc.clone());
+        }
+        for postings in compacted.terms.values_mut() {
+            postings.finish_blocks(&compacted.docs);
+        }
+        let segment = if compacted.docs.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(compacted))
+        };
+        Snapshot::default().with_prebuilt_commit(self.generation, segment, Vec::new())
     }
 
     #[inline]
@@ -1072,5 +1105,61 @@ mod tests {
         assert_eq!(list.blocks.len(), 3);
         assert_eq!(list.blocks[0].end, 128);
         assert_eq!(list.blocks[2].end, 300);
+    }
+
+    #[test]
+    fn compaction_remaps_existing_postings_without_retokenizing_fields() {
+        let mut snapshot = Snapshot::default().with_commit(
+            1,
+            vec![
+                (20, vec!["alpha original".to_owned()]),
+                (10, vec!["obsolete value".to_owned()]),
+            ],
+            Vec::new(),
+        );
+        snapshot = snapshot.with_commit(
+            2,
+            vec![(10, vec!["beta replacement".to_owned()])],
+            Vec::new(),
+        );
+        std::sync::Arc::make_mut(&mut snapshot.segments[0]).docs[0].fields[0] =
+            "stored field changed after indexing".to_owned();
+
+        let compacted = snapshot.compacted();
+        assert_eq!(compacted.segments.len(), 1);
+        assert_eq!(
+            compacted.segments[0]
+                .docs
+                .iter()
+                .map(|doc| doc.rowid)
+                .collect::<Vec<_>>(),
+            [10, 20]
+        );
+        let options = SearchOptions {
+            cache: false,
+            ..SearchOptions::default()
+        };
+        for query in [Query::term("alpha"), Query::term("beta")] {
+            let before = snapshot.search(&query, options, false);
+            let after = compacted.search(&query, options, false);
+            assert_eq!(
+                after
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.rowid, hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                before
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.rowid, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            compacted
+                .search(&Query::term("changed"), options, false)
+                .hits
+                .is_empty()
+        );
     }
 }
